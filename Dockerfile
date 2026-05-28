@@ -5,9 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY bot.py translator.py config.py ./
+# 原始碼透過 docker-compose volumes 掛載，不打包進 image
+# 只有 requirements.txt 變更時才需要重新建置 image
 
-# channel_config.json is stored on the mounted volume
 ENV CONFIG_FILE=/data/channel_config.json
 
 VOLUME ["/data"]
