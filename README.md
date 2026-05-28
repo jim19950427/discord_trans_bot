@@ -1,51 +1,86 @@
 # Discord Translation Bot
 
-A Discord bot that bridges multiple language channels. Messages posted in any registered language channel are automatically translated and forwarded to all other registered channels.
+A Discord bot that bridges multiple language channels. Messages posted in any registered language channel are automatically translated and forwarded to all other registered channels — appearing as if the **original user** sent them (via Discord Webhooks).
 
-## Features
+## How It Works
 
-- Register any text channel as a "language channel" with a language code
-- Messages are auto-translated and re-posted to every other language channel via embeds
-- Simple slash-style prefix commands (`!setlang`, `!unsetlang`, `!listlang`)
-- Config is persisted to `channel_config.json` — survives restarts
+```
+A types "你好" in #中文
+    ↓
+Bot (as A's name + avatar) posts "Hello"      → #english
+Bot (as A's name + avatar) posts "こんにちは"  → #日本語
+Bot (as A's name + avatar) posts "안녕하세요"  → #한국어
+
+B types "Hello" in #english
+    ↓
+Bot (as B's name + avatar) posts "你好"        → #中文
+Bot (as B's name + avatar) posts "こんにちは"  → #日本語
+...
+```
+
+## Requirements
+
+- Discord bot with **Message Content Intent** enabled
+- Bot permissions: `Send Messages`, `Manage Webhooks`, `Read Message History`
 
 ## Setup
 
-1. **Clone and install dependencies**
-   ```bash
-   pip install -r requirements.txt
+### Local
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env   # fill in DISCORD_TOKEN
+python bot.py
+```
+
+### Synology DSM Docker (recommended)
+
+1. Copy the project folder to your Synology NAS (e.g. via File Station to `/docker/discord_trans_bot`)
+
+2. Create the `.env` file:
+   ```
+   DISCORD_TOKEN=your_token_here
    ```
 
-2. **Create a Discord application and bot**
-   - Go to https://discord.com/developers/applications
-   - Create a new application → Bot → copy the token
-   - Enable **Message Content Intent** under Bot → Privileged Gateway Intents
-
-3. **Configure the bot**
+3. Create the data directory:
    ```bash
-   cp .env.example .env
-   # Edit .env and paste your bot token
+   mkdir -p data
    ```
 
-4. **Invite the bot to your server**
-   - OAuth2 → URL Generator → Scopes: `bot` → Permissions: `Send Messages`, `Read Message History`, `Embed Links`
-
-5. **Run the bot**
+4. **Option A — Docker Compose (SSH)**
    ```bash
-   python bot.py
+   docker compose up -d
    ```
+
+5. **Option B — DSM Container Manager UI**
+   - Build image: Container Manager → Registry → Build from folder
+   - Or pull from your own registry after `docker build -t discord-trans-bot .`
+   - Create container with:
+     - Environment variable: `DISCORD_TOKEN=...`
+     - Volume: `/docker/discord_trans_bot/data` → `/data`
+     - Restart policy: Always
+
+The bot stores its channel config in `/data/channel_config.json` — this persists across container restarts.
+
+## Discord Bot Configuration
+
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications)
+2. Create application → Bot → copy token
+3. Enable **Message Content Intent** (Bot → Privileged Gateway Intents)
+4. OAuth2 → URL Generator:
+   - Scopes: `bot`
+   - Permissions: `Send Messages`, `Manage Webhooks`, `Read Message History`, `Embed Links`
+5. Invite bot to your server
 
 ## Commands
 
 | Command | Permission | Description |
 |---------|-----------|-------------|
-| `!setlang <lang_code> [#channel]` | Manage Channels | Register a channel as a language channel |
-| `!unsetlang [#channel]` | Manage Channels | Remove a channel from the language list |
+| `!setlang <lang_code> [#channel]` | Manage Channels | Register a channel and auto-create its webhook |
+| `!unsetlang [#channel]` | Manage Channels | Remove a channel and delete its webhook |
 | `!listlang` | Everyone | List all registered language channels |
 
-## Language Codes
-
-Use [ISO 639-1](https://en.wikipedia.org/wiki/List_of_ISO_639-1_codes) two-letter codes:
+## Language Codes (ISO 639-1)
 
 | Code | Language |
 |------|----------|
@@ -62,7 +97,7 @@ Full list: https://py-googletrans.readthedocs.io/en/latest/
 
 ## Example Setup
 
-In Discord, run these commands (requires Manage Channels permission):
+Run once in your server (requires Manage Channels permission):
 
 ```
 !setlang zh-TW #中文
@@ -71,16 +106,4 @@ In Discord, run these commands (requires Manage Channels permission):
 !setlang ko #한국어
 ```
 
-Now any message in `#中文` will be automatically translated and posted to `#english`, `#日本語`, and `#한국어` — and vice versa.
-
-## How It Works
-
-```
-User sends "你好" in #中文
-    ↓
-Bot detects the channel is registered as zh-TW
-    ↓
-Bot translates to en → "Hello"       → posts to #english
-Bot translates to ja → "こんにちは"   → posts to #日本語
-Bot translates to ko → "안녕하세요"   → posts to #한국어
-```
+The bot will automatically create a webhook in each channel. From then on, all messages are translated and forwarded instantly.

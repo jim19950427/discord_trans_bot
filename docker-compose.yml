@@ -1,0 +1,10 @@
+services:
+  discord-trans-bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    environment:
+      - CONFIG_FILE=/data/channel_config.json

@@ -1,5 +1,6 @@
 import os
 import asyncio
+import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -15,8 +16,10 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# guild_id -> {channel_id: lang_code}
-channel_configs: dict[int, dict[int, str]] = {}
+# guild_id -> {channel_id: {"lang": str, "webhook_url": str}}
+channel_configs: dict[int, dict[int, dict]] = {}
+
+WEBHOOK_NAME = "TranslationBot"
 
 
 @bot.event
@@ -38,40 +41,36 @@ async def on_message(message: discord.Message):
     if message.channel.id not in guild_channels:
         return
 
-    source_lang = guild_channels[message.channel.id]
+    source_info = guild_channels[message.channel.id]
+    source_lang = source_info["lang"]
     content = message.content.strip()
     if not content:
         return
 
-    author_name = message.author.display_name
+    username = message.author.display_name
+    avatar_url = str(message.author.display_avatar.url)
 
     tasks = []
-    for channel_id, target_lang in guild_channels.items():
+    for channel_id, info in guild_channels.items():
         if channel_id == message.channel.id:
             continue
-        target_channel = bot.get_channel(channel_id)
-        if target_channel is None:
+        target_lang = info["lang"]
+        webhook_url = info.get("webhook_url")
+        if not webhook_url:
             continue
-        tasks.append(_translate_and_send(content, source_lang, target_lang, target_channel, author_name))
+        tasks.append(_translate_and_send(content, source_lang, target_lang, webhook_url, username, avatar_url))
 
     if tasks:
         await asyncio.gather(*tasks)
 
 
-async def _translate_and_send(text: str, src: str, dest: str, channel: discord.TextChannel, author: str):
+async def _translate_and_send(text: str, src: str, dest: str, webhook_url: str, username: str, avatar_url: str):
     translated = await asyncio.to_thread(translate_text, text, src, dest)
-    if translated:
-        embed = discord.Embed(description=translated, color=discord.Color.blurple())
-        embed.set_footer(text=f"From #{channel.guild.get_channel(_find_src_channel(channel.guild, src)).name} | {author}")
-        await channel.send(embed=embed)
-
-
-def _find_src_channel(guild: discord.Guild, src_lang: str) -> int:
-    guild_channels = channel_configs.get(guild.id, {})
-    for ch_id, lang in guild_channels.items():
-        if lang == src_lang:
-            return ch_id
-    return 0
+    if not translated:
+        return
+    async with aiohttp.ClientSession() as session:
+        webhook = discord.Webhook.from_url(webhook_url, session=session)
+        await webhook.send(content=translated, username=username, avatar_url=avatar_url)
 
 
 @bot.command(name="setlang")
@@ -81,10 +80,19 @@ async def set_lang(ctx: commands.Context, lang_code: str, channel: discord.TextC
     target = channel or ctx.channel
     guild_id = ctx.guild.id
 
+    # Find existing TranslationBot webhook or create one
+    webhooks = await target.webhooks()
+    webhook = next((w for w in webhooks if w.name == WEBHOOK_NAME), None)
+    if webhook is None:
+        webhook = await target.create_webhook(name=WEBHOOK_NAME)
+
     if guild_id not in channel_configs:
         channel_configs[guild_id] = {}
 
-    channel_configs[guild_id][target.id] = lang_code.lower()
+    channel_configs[guild_id][target.id] = {
+        "lang": lang_code.lower(),
+        "webhook_url": webhook.url,
+    }
     save_channel_config(channel_configs)
     await ctx.send(f"Set {target.mention} as the `{lang_code}` language channel.")
 
@@ -99,6 +107,16 @@ async def unset_lang(ctx: commands.Context, channel: discord.TextChannel = None)
     removed = channel_configs.get(guild_id, {}).pop(target.id, None)
     if removed:
         save_channel_config(channel_configs)
+
+        # Clean up the webhook we created
+        try:
+            webhooks = await target.webhooks()
+            for wh in webhooks:
+                if wh.name == WEBHOOK_NAME:
+                    await wh.delete()
+        except discord.Forbidden:
+            pass
+
         await ctx.send(f"Removed {target.mention} from language channels.")
     else:
         await ctx.send(f"{target.mention} was not a registered language channel.")
@@ -109,14 +127,14 @@ async def list_lang(ctx: commands.Context):
     """List all registered language channels in this server."""
     guild_channels = channel_configs.get(ctx.guild.id, {})
     if not guild_channels:
-        await ctx.send("No language channels registered yet. Use `!setlang <lang_code>` to add one.")
+        await ctx.send("No language channels registered. Use `!setlang <lang_code>` to add one.")
         return
 
     lines = []
-    for ch_id, lang in guild_channels.items():
+    for ch_id, info in guild_channels.items():
         ch = bot.get_channel(ch_id)
-        ch_mention = ch.mention if ch else f"(unknown channel {ch_id})"
-        lines.append(f"{ch_mention} → `{lang}`")
+        ch_mention = ch.mention if ch else f"(unknown {ch_id})"
+        lines.append(f"{ch_mention} → `{info['lang']}`")
 
     embed = discord.Embed(title="Language Channels", description="\n".join(lines), color=discord.Color.green())
     await ctx.send(embed=embed)
