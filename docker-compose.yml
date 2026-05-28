@@ -1,0 +1,15 @@
+services:
+  discord-trans-bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # 原始碼掛載：更新只需替換檔案後重啟容器，不需重新建置 image
+      - ./bot.py:/app/bot.py
+      - ./translator.py:/app/translator.py
+      - ./config.py:/app/config.py
+      # 頻道設定持久化
+      - ./data:/data
+    environment:
+      - CONFIG_FILE=/data/channel_config.json
