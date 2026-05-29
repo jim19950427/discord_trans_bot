@@ -57,7 +57,7 @@ B 在 #english 輸入「Good morning」
    - `嵌入連結`
 4. 複製頁面下方產生的 URL，在瀏覽器開啟，選擇你的伺服器並授權
 
-> **關於 Webhook**：你不需要手動建立 Webhook。當你執行 `/setlang` 指令時，機器人會自動在該頻道建立一個名為 `TranslationBot` 的 Webhook，並將 URL 儲存在設定檔中。這個 Webhook 讓機器人能以原始用戶的名字和頭像發送翻譯後的訊息。
+> **關於 Webhook**：你不需要手動建立 Webhook。當你執行 `/addlang` 指令時，機器人會自動在該頻道建立一個名為 `TranslationBot` 的 Webhook，並將 URL 儲存在設定檔中。這個 Webhook 讓機器人能以原始用戶的名字和頭像發送翻譯後的訊息。
 
 > **⚠️ 關於置頂同步（重要）**：Discord 的頻道層級權限可能會覆蓋角色設定。若置頂同步無效，請確認 Bot 在**每個語言頻道**都有「**管理訊息**」權限：前往伺服器設定 → 頻道 → 編輯各語言頻道 → 權限 → 找到 Bot 角色 → 開啟「管理訊息」✅。或直接在**伺服器設定 → 角色**中給 Bot 角色全伺服器的「管理訊息」權限（更方便）。
 
@@ -142,15 +142,15 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 機器人啟動後，在你的 Discord 伺服器中執行以下指令進行初始設定。  
 **Slash 指令**（`/`）為主要方式，舊版 `!` 前綴指令仍可使用。
 
-> **注意**：Slash 指令在機器人首次啟動後最多需要 **1 小時**才會在 Discord 全域生效。等待期間可先使用 `!` 前綴版本（例如 `!setlang zh-TW`）。
+> **注意**：Slash 指令在機器人首次啟動後最多需要 **1 小時**才會在 Discord 全域生效。等待期間可先使用 `!` 前綴版本（例如 `!addlang zh-TW`）。
 
 ### 初始設定範例
 
 ```
-/setlang lang_code:zh-TW channel:#中文
-/setlang lang_code:en channel:#english
-/setlang lang_code:ja channel:#日本語
-/setlang lang_code:ko channel:#한국어
+/addlang lang_code:zh-TW channel:#中文
+/addlang lang_code:en channel:#english
+/addlang lang_code:ja channel:#日本語
+/addlang lang_code:ko channel:#한국어
 ```
 
 執行後機器人會自動在各頻道建立 Webhook，之後所有訊息會自動翻譯並同步。
@@ -159,8 +159,8 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 
 | Slash 指令 | 前綴指令（備用） | 所需權限 | 說明 |
 |-----------|----------------|---------|------|
-| `/setlang lang_code:<代碼> [channel:#頻道]` | `!setlang <代碼> [#頻道]` | 管理頻道 | 將頻道設為語言頻道（省略頻道則為目前頻道） |
-| `/unsetlang [channel:#頻道]` | `!unsetlang [#頻道]` | 管理頻道 | 取消語言頻道設定並刪除對應 Webhook |
+| `/addlang lang_code:<代碼> [channel:#頻道]` | `!addlang <代碼> [#頻道]` | 管理頻道 | 將頻道設為語言頻道（省略頻道則為目前頻道） |
+| `/removelang [channel:#頻道]` | `!removelang [#頻道]` | 管理頻道 | 取消語言頻道設定並刪除對應 Webhook |
 | `/listlang` | `!listlang` | 所有人 | 列出目前所有語言頻道 |
 
 ### 詞彙表指令
@@ -201,9 +201,9 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 
 **範例：**
 ```
-/addsub word:桃桃 replacement:屁股
+/addsub word:484 replacement:是不是
 ```
-之後有人傳送「打你桃桃」，其他語言頻道會翻譯「打你屁股」的結果，而不是翻譯「桃桃」。
+之後有人傳送「484太強了」，其他語言頻道會翻譯「是不是太強了」的結果，而不是翻譯機器看不懂的「484」。
 
 > **與詞彙表的差異：**  
 > - 翻譯前替換：修改**來源文字**再交給翻譯引擎（結果語言自然）  

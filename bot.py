@@ -693,13 +693,13 @@ async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> 
 # Prefix commands (legacy / backwards-compat)
 # ---------------------------------------------------------------------------
 
-@bot.command(name="setlang")
+@bot.command(name="addlang")
 @commands.has_permissions(manage_channels=True)
 async def prefix_setlang(ctx: commands.Context, lang_code: str, channel: discord.TextChannel = None):
     await _do_setlang(ctx.guild.id, channel or ctx.channel, lang_code, ctx.send)
 
 
-@bot.command(name="unsetlang")
+@bot.command(name="removelang")
 @commands.has_permissions(manage_channels=True)
 async def prefix_unsetlang(ctx: commands.Context, channel: discord.TextChannel = None):
     await _do_unsetlang(ctx.guild.id, channel or ctx.channel, ctx.send)
@@ -714,13 +714,13 @@ async def prefix_listlang(ctx: commands.Context):
 # Slash commands
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="setlang", description="設定語言頻道")
+@bot.tree.command(name="addlang", description="設定語言頻道")
 @app_commands.describe(
     lang_code="語言代碼（例如 zh-TW, en, ja, ko）",
     channel="目標頻道（留空表示目前頻道）",
 )
 @app_commands.checks.has_permissions(manage_channels=True)
-async def slash_setlang(
+async def slash_addlang(
     interaction: discord.Interaction,
     lang_code: str,
     channel: discord.TextChannel = None,
@@ -733,10 +733,10 @@ async def slash_setlang(
     )
 
 
-@bot.tree.command(name="unsetlang", description="取消語言頻道設定")
+@bot.tree.command(name="removelang", description="取消語言頻道設定")
 @app_commands.describe(channel="目標頻道（留空表示目前頻道）")
 @app_commands.checks.has_permissions(manage_channels=True)
-async def slash_unsetlang(
+async def slash_removelang(
     interaction: discord.Interaction,
     channel: discord.TextChannel = None,
 ):
@@ -909,8 +909,8 @@ async def slash_listsubs(interaction: discord.Interaction):
 
 
 # Slash command error handlers
-@slash_setlang.error
-@slash_unsetlang.error
+@slash_addlang.error
+@slash_removelang.error
 @slash_addterm.error
 @slash_removeterm.error
 @slash_addproper.error
@@ -963,7 +963,7 @@ async def _do_unsetlang(guild_id: int, target: discord.TextChannel, respond) -> 
 async def _do_listlang(guild_id: int, respond) -> None:
     guild_channels = channel_configs.get(guild_id, {})
     if not guild_channels:
-        await respond("No language channels registered. Use `/setlang` to add one.")
+        await respond("No language channels registered. Use `/addlang` to add one.")
         return
     lines = []
     for ch_id, info in guild_channels.items():
