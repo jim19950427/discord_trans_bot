@@ -83,11 +83,12 @@ async def on_message(message: discord.Message):
             continue
         target_lang = info["lang"]
         quoted = ref_cluster["contents"].get(channel_id) if ref_cluster else None
+        quoted_author = ref_cluster.get("author") if ref_cluster else None
         tasks.append(
             _translate_and_send(
                 content, source_lang, target_lang,
                 webhook_url, username, avatar_url,
-                list(attachments), quoted,
+                list(attachments), quoted, quoted_author,
             )
         )
         target_channel_ids.append(channel_id)
@@ -101,6 +102,7 @@ async def on_message(message: discord.Message):
     cluster: dict = {
         "channels": {message.channel.id: message.id},
         "contents": {message.channel.id: content},
+        "author": username,
     }
     for ch_id, result in zip(target_channel_ids, results):
         if result is not None:
@@ -119,6 +121,7 @@ async def _translate_and_send(
     avatar_url: str,
     attachments: list,
     quoted_content: str | None,
+    quoted_author: str | None = None,
 ) -> tuple[int, str] | None:
     translated: str | None = None
     if text:
@@ -142,8 +145,12 @@ async def _translate_and_send(
     # Build message content: optional blockquote for reply context + translation
     parts: list[str] = []
     if quoted_content:
-        quoted_lines = "\n".join(f"> {line}" for line in quoted_content.splitlines())
-        parts.append(quoted_lines)
+        lines = quoted_content.splitlines()
+        if quoted_author and lines:
+            parts.append(f"> **{quoted_author}**: {lines[0]}")
+            parts.extend(f"> {line}" for line in lines[1:])
+        else:
+            parts.extend(f"> {line}" for line in lines)
     if translated:
         parts.append(translated)
     final_content = "\n".join(parts) if parts else None
