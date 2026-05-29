@@ -46,12 +46,11 @@ B 在 #english 輸入「Good morning」
 2. **Scopes** 勾選：
    - `bot`
 3. **Bot Permissions** 勾選：
-   - `Read Messages/View Channels`
-   - `Send Messages`
-   - `Read Message History`
-   - `Manage Webhooks`（**必須**，機器人會自動在頻道建立 Webhook）
-   - `Add Reactions`（**必須**，用於同步各頻道的 Reaction）
-   - `Embed Links`
+   - `傳送訊息`
+   - `讀取訊息歷史記錄`
+   - `管理 Webhook`（**必須**，機器人會自動在頻道建立 Webhook）
+   - `新增反應`（**必須**，用於同步各頻道的 Reaction）
+   - `嵌入連結`
 4. 複製頁面下方產生的 URL，在瀏覽器開啟，選擇你的伺服器並授權
 
 > **關於 Webhook**：你不需要手動建立 Webhook。當你在 Discord 執行 `!setlang` 指令時，機器人會自動在該頻道建立一個名為 `TranslationBot` 的 Webhook，並將 URL 儲存在設定檔中。這個 Webhook 讓機器人能以原始用戶的名字和頭像發送翻譯後的訊息。
