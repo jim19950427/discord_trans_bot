@@ -117,6 +117,12 @@ def translate_text(
                 _try_google(segment, src, dest)
                 or _try_google(segment, "auto", dest)
             )
+            if line_result:
+                line_result = _restore_glossary(line_result, placeholder_map)
+            else:
+                # Translation failed — restore glossary on the placeholder segment
+                # so glossary terms are still applied (e.g. "§0§" → "好的")
+                line_result = _restore_glossary(segment, placeholder_map)
         else:
             line_result = _cached_translate(segment, src, dest)
 
@@ -124,9 +130,6 @@ def translate_text(
             print(f"[translate] all attempts failed ({src}->{dest}): {repr(line_stripped)}")
             translated_lines.append(line_stripped)
             continue
-
-        if placeholder_map:
-            line_result = _restore_glossary(line_result, placeholder_map)
 
         translated_lines.append(line_result)
 
