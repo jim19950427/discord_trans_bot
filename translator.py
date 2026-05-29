@@ -113,16 +113,20 @@ def translate_text(
             segment, placeholder_map = _apply_glossary(segment, dest, glossary)
 
         if placeholder_map:
-            line_result = (
-                _try_google(segment, src, dest)
-                or _try_google(segment, "auto", dest)
-            )
-            if line_result:
-                line_result = _restore_glossary(line_result, placeholder_map)
-            else:
-                # Translation failed — restore glossary on the placeholder segment
-                # so glossary terms are still applied (e.g. "§0§" → "好的")
+            # If the entire line is covered by glossary placeholders, skip
+            # translation and restore directly — glossary takes priority.
+            remainder = re.sub(r"§\d+§", "", segment).strip()
+            if not remainder:
                 line_result = _restore_glossary(segment, placeholder_map)
+            else:
+                line_result = (
+                    _try_google(segment, src, dest)
+                    or _try_google(segment, "auto", dest)
+                )
+                if line_result:
+                    line_result = _restore_glossary(line_result, placeholder_map)
+                else:
+                    line_result = _restore_glossary(segment, placeholder_map)
         else:
             line_result = _cached_translate(segment, src, dest)
 
