@@ -65,7 +65,9 @@ def _try_mymemory(text: str, src: str, dest: str) -> str | None:
         result = MyMemoryTranslator(source=mm_src, target=mm_dest).translate(text)
         if result:
             result = _HTML_TAG_RE.sub("", result).strip()
-        return result or None
+        if result and result.strip() != text.strip():
+            return result
+        return None
     except Exception as e:
         print(f"MyMemory fallback error ({src} -> {dest}): {e}")
         return None
@@ -149,7 +151,10 @@ def translate_text(
             line_result = _cached_translate(segment, src, dest)
 
         if not line_result:
-            return None
+            # Both engines failed — keep original text for this line
+            print(f"Translation failed ({src}->{dest}): {repr(line_stripped)}")
+            translated_lines.append(line_stripped)
+            continue
 
         if placeholder_map:
             line_result = _restore_glossary(line_result, placeholder_map)
