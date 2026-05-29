@@ -20,24 +20,26 @@ def normalize_lang(code: str) -> str:
 
 
 def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | None:
-    """Call Google Translate with retries for both rate-limit errors and untranslated results."""
+    """Call Google Translate with retries for rate limits, untranslated results, and no-result errors."""
     for attempt in range(retries):
         try:
             result = GoogleTranslator(source=source, target=target).translate(text)
             if result and result.strip() != text.strip():
                 return result
             # Result equals input — Google returned original text unchanged.
-            # Wait and retry; this is usually a temporary API issue.
             if attempt < retries - 1:
-                wait = 2 ** attempt  # 1 s, 2 s, 4 s
+                wait = 2 ** attempt
                 print(f"[translate] result==input ({source}->{target}) attempt {attempt+1}, retrying in {wait}s")
                 time.sleep(wait)
         except Exception as e:
             err = str(e).lower()
-            if any(k in err for k in ("429", "too many", "rate limit", "quota")):
+            retryable = any(k in err for k in (
+                "429", "too many", "rate limit", "quota", "no translation was found"
+            ))
+            if retryable:
                 if attempt < retries - 1:
                     wait = 2 ** attempt
-                    print(f"[translate] rate limit ({source}->{target}) attempt {attempt+1}, retrying in {wait}s")
+                    print(f"[translate] retryable error ({source}->{target}) attempt {attempt+1}: {e}, retrying in {wait}s")
                     time.sleep(wait)
                 continue
             print(f"Google Translate error (source={source}, target={target}): {e}")
@@ -45,14 +47,29 @@ def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | 
     return None
 
 
+def _source_variants(src: str) -> list[str]:
+    """Return source codes to try in order. CJK sources get extra fallbacks."""
+    lower = src.lower()
+    if lower == "zh-tw":
+        return [src, "zh-CN", "zh", "auto"]
+    if lower == "zh-cn":
+        return [src, "zh", "auto"]
+    return [src, "auto"]
+
+
+def _translate_with_fallback(text: str, src: str, dest: str) -> str | None:
+    """Try source variants in order until one returns a translation."""
+    for source in _source_variants(src):
+        result = _try_google(text, source, dest)
+        if result:
+            return result
+    return None
+
+
 @lru_cache(maxsize=2000)
 def _cached_translate(text: str, src: str, dest: str) -> str | None:
     print(f"[translate] ({src}->{dest}) input: {repr(text)}")
-    # Try explicit source first — more reliable for CJK languages
-    result = _try_google(text, src, dest)
-    if not result:
-        # Auto-detect as secondary attempt
-        result = _try_google(text, "auto", dest)
+    result = _translate_with_fallback(text, src, dest)
     print(f"[translate] ({src}->{dest}) output: {repr(result)}")
     return result
 
@@ -129,10 +146,7 @@ def translate_text(
             if not remainder:
                 line_result = _restore_glossary(segment, placeholder_map)
             else:
-                line_result = (
-                    _try_google(segment, src, dest)
-                    or _try_google(segment, "auto", dest)
-                )
+                line_result = _translate_with_fallback(segment, src, dest)
                 if line_result:
                     line_result = _restore_glossary(line_result, placeholder_map)
                 else:
