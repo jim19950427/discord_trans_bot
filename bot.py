@@ -8,7 +8,10 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from translator import translate_text, normalize_lang
 from config import load_channel_config, save_channel_config
-from glossary import load_glossary, save_glossary, get_guild_glossary
+from glossary import (
+    load_glossary, save_glossary, get_guild_glossary,
+    load_substitutions, save_substitutions, get_guild_substitutions,
+)
 
 load_dotenv()
 
@@ -25,8 +28,12 @@ channel_configs: dict[int, dict[int, dict]] = {}
 # {str(guild_id): {source_term: {target_lang: translation}}}
 _glossary_data: dict = {}
 
+# {str(guild_id): {source_term: replacement}}
+_substitutions_data: dict = {}
+
 WEBHOOK_NAME = "TranslationBot"
 NO_TRANSLATE_PREFIX = "//"
+RAW_FORWARD_PREFIX = "\\"
 
 # msg_id -> cluster dict shared by all messages in a translation group
 # cluster keys:
@@ -69,9 +76,22 @@ def _guild_channels_for(channel_id: int) -> dict:
 
 @bot.event
 async def on_ready():
-    global channel_configs, _glossary_data
+    global channel_configs, _glossary_data, _substitutions_data
     channel_configs = load_channel_config()
     _glossary_data = load_glossary()
+    _substitutions_data = load_substitutions()
+
+    # Pre-populate pin cache so the first pin event doesn't treat all existing
+    # pins as newly added (which would cause spurious sync attempts).
+    for gc in channel_configs.values():
+        for ch_id in gc:
+            ch = bot.get_channel(ch_id)
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    _channel_pins[ch_id] = {m.id async for m in ch.pins()}
+                except discord.HTTPException:
+                    _channel_pins[ch_id] = set()
+
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Loaded channel configs for {len(channel_configs)} guild(s)")
     try:
@@ -105,6 +125,11 @@ async def on_message(message: discord.Message):
     attachments = list(message.attachments)
     stickers = [s for s in message.stickers if s.format != discord.StickerFormatType.lottie]
 
+    # \ prefix: forward original text as-is to all channels, no translation
+    raw_forward = content.startswith(RAW_FORWARD_PREFIX)
+    if raw_forward:
+        content = content[len(RAW_FORWARD_PREFIX):].lstrip()
+
     if not content and not attachments and not stickers:
         return
 
@@ -112,6 +137,7 @@ async def on_message(message: discord.Message):
     username = message.author.display_name
     avatar_url = str(message.author.display_avatar.url)
     guild_glossary = get_guild_glossary(message.guild.id, _glossary_data)
+    guild_substitutions = get_guild_substitutions(message.guild.id, _substitutions_data)
 
     ref_cluster = None
     if message.reference and message.reference.message_id:
@@ -129,11 +155,15 @@ async def on_message(message: discord.Message):
         quoted = ref_cluster["contents"].get(channel_id) if ref_cluster else None
         quoted_author = ref_cluster.get("author") if ref_cluster else None
         tasks.append(
+            _raw_forward_send(
+                content, webhook_url, username, avatar_url, attachments, stickers,
+                quoted, quoted_author,
+            ) if raw_forward else
             _translate_and_send(
                 content, source_lang, target_lang,
                 webhook_url, username, avatar_url,
                 attachments, stickers, quoted, quoted_author,
-                guild_glossary,
+                guild_glossary, guild_substitutions,
             )
         )
         target_channel_ids.append(channel_id)
@@ -177,6 +207,23 @@ async def on_message(message: discord.Message):
 
     _store_cluster(cluster)
 
+    # Schedule a delayed retry for channels where translation failed
+    # (sent text equals original source text — translation fell back to original)
+    if not raw_forward and content:
+        for ch_id, result in zip(target_channel_ids, results):
+            if result is None:
+                continue
+            sent_id, sent_text = result
+            if sent_text.strip() == content.strip():
+                asyncio.create_task(
+                    _retry_translate(
+                        content, source_lang,
+                        guild_channels[ch_id]["lang"],
+                        guild_channels[ch_id]["webhook_url"],
+                        sent_id, ch_id, cluster, guild_glossary,
+                    )
+                )
+
 
 @bot.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
@@ -207,6 +254,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
     source_lang = guild_channels[payload.channel_id]["lang"]
     guild_glossary = get_guild_glossary(channel.guild.id, _glossary_data)
+    guild_substitutions = get_guild_substitutions(channel.guild.id, _substitutions_data)
 
     edit_targets = [
         (ch_id, msg_id, guild_channels[ch_id]["lang"], guild_channels[ch_id]["webhook_url"])
@@ -248,7 +296,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                 wh_url, cluster["author"], cluster["avatar_url"],
                 current_attachments, current_stickers,
                 cluster.get("prefixes", {}).get(ch_id),
-                None, guild_glossary,
+                None, guild_glossary, guild_substitutions,
             )
             for ch_id, _, lang, wh_url in edit_targets
         ])
@@ -265,7 +313,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                 _msg_clusters[new_msg_id] = cluster
     elif new_content:
         edit_results = await asyncio.gather(*[
-            _translate_and_edit(new_content, source_lang, lang, wh_url, msg_id, ch_id, cluster, guild_glossary)
+            _translate_and_edit(new_content, source_lang, lang, wh_url, msg_id, ch_id, cluster, guild_glossary, guild_substitutions)
             for ch_id, msg_id, lang, wh_url in edit_targets
         ])
         cluster["contents"][payload.channel_id] = new_content
@@ -416,11 +464,9 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
     if channel.id not in guild_channels:
         return
     try:
-        pins = await channel.pins()
+        current_ids = {m.id async for m in channel.pins()}
     except discord.HTTPException:
         return
-
-    current_ids = {m.id for m in pins}
     prev_ids = _channel_pins.get(channel.id, set())
     _channel_pins[channel.id] = current_ids
 
@@ -431,11 +477,14 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
         for ch_id, cluster_msg_id in cluster["channels"].items():
             if ch_id == channel.id:
                 continue
+            if cluster_msg_id in _channel_pins.get(ch_id, set()):
+                continue  # already pinned — skip to avoid cascade re-pinning
             ch = bot.get_channel(ch_id)
             if not ch:
                 continue
             try:
                 await (await ch.fetch_message(cluster_msg_id)).pin()
+                _channel_pins.setdefault(ch_id, set()).add(cluster_msg_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                 print(f"Failed to pin {cluster_msg_id} in channel {ch_id}: {e}")
 
@@ -446,11 +495,14 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
         for ch_id, cluster_msg_id in cluster["channels"].items():
             if ch_id == channel.id:
                 continue
+            if cluster_msg_id not in _channel_pins.get(ch_id, set()):
+                continue  # not pinned there — skip to avoid cascade
             ch = bot.get_channel(ch_id)
             if not ch:
                 continue
             try:
                 await (await ch.fetch_message(cluster_msg_id)).unpin()
+                _channel_pins.get(ch_id, set()).discard(cluster_msg_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                 print(f"Failed to unpin {cluster_msg_id} in channel {ch_id}: {e}")
 
@@ -458,6 +510,86 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _retry_translate(
+    text: str,
+    src: str,
+    dest: str,
+    webhook_url: str,
+    msg_id: int,
+    ch_id: int,
+    cluster: dict,
+    glossary: dict | None = None,
+    delay: int = 10,
+) -> None:
+    await asyncio.sleep(delay)
+    translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {})
+    if not translated or translated.strip() == text.strip():
+        print(f"[retry] still failed ({src}->{dest}): {repr(text)}")
+        return
+    prefix = cluster.get("prefixes", {}).get(ch_id, "")
+    full_content = f"{prefix}\n{translated}" if prefix else translated
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            await webhook.edit_message(msg_id, content=full_content)
+        cluster["contents"][ch_id] = translated
+        print(f"[retry] updated ({src}->{dest}): {repr(translated)}")
+    except Exception as e:
+        print(f"[retry] edit failed msg={msg_id} ch={ch_id}: {e}")
+
+
+async def _raw_forward_send(
+    text: str,
+    webhook_url: str,
+    username: str,
+    avatar_url: str,
+    attachments: list,
+    stickers: list,
+    quoted_content: str | None,
+    quoted_author: str | None = None,
+) -> tuple[int, str] | None:
+    files: list[discord.File] = []
+    urls: list[tuple[str, str]] = (
+        [(att.url, att.filename) for att in attachments]
+        + [(s.url, f"{s.name}.{'gif' if s.format == discord.StickerFormatType.gif else 'png'}") for s in stickers]
+    )
+    for url, filename in urls:
+        try:
+            async with aiohttp.ClientSession() as dl:
+                async with dl.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        files.append(discord.File(io.BytesIO(data), filename=filename))
+        except Exception as e:
+            print(f"Download failed ({filename}): {e}")
+
+    if not text and not files:
+        return None
+
+    parts: list[str] = []
+    if quoted_content:
+        lines = quoted_content.splitlines()
+        if quoted_author and lines:
+            parts.append(f"> **{quoted_author}**: {lines[0]}")
+            parts.extend(f"> {line}" for line in lines[1:])
+        else:
+            parts.extend(f"> {line}" for line in lines)
+    if text:
+        parts.append(text)
+    final_content = "\n".join(parts) if parts else None
+
+    send_kwargs: dict = {"username": username, "avatar_url": avatar_url, "wait": True}
+    if final_content:
+        send_kwargs["content"] = final_content
+    if files:
+        send_kwargs["files"] = files
+
+    async with aiohttp.ClientSession() as session:
+        webhook = discord.Webhook.from_url(webhook_url, session=session)
+        msg = await webhook.send(**send_kwargs)
+        return msg.id, text or ""
+
 
 async def _translate_and_send(
     text: str,
@@ -471,10 +603,11 @@ async def _translate_and_send(
     quoted_content: str | None,
     quoted_author: str | None = None,
     glossary: dict | None = None,
+    substitutions: dict | None = None,
 ) -> tuple[int, str] | None:
     translated: str | None = None
     if text:
-        translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {})
+        translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {}, substitutions or {})
 
     files: list[discord.File] = []
     urls: list[tuple[str, str]] = (
@@ -527,8 +660,9 @@ async def _translate_and_edit(
     ch_id: int,
     cluster: dict,
     glossary: dict | None = None,
+    substitutions: dict | None = None,
 ) -> str | None:
-    translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {})
+    translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {}, substitutions or {})
     if not translated:
         return None
 
@@ -559,13 +693,13 @@ async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> 
 # Prefix commands (legacy / backwards-compat)
 # ---------------------------------------------------------------------------
 
-@bot.command(name="setlang")
+@bot.command(name="addlang")
 @commands.has_permissions(manage_channels=True)
 async def prefix_setlang(ctx: commands.Context, lang_code: str, channel: discord.TextChannel = None):
     await _do_setlang(ctx.guild.id, channel or ctx.channel, lang_code, ctx.send)
 
 
-@bot.command(name="unsetlang")
+@bot.command(name="removelang")
 @commands.has_permissions(manage_channels=True)
 async def prefix_unsetlang(ctx: commands.Context, channel: discord.TextChannel = None):
     await _do_unsetlang(ctx.guild.id, channel or ctx.channel, ctx.send)
@@ -580,13 +714,13 @@ async def prefix_listlang(ctx: commands.Context):
 # Slash commands
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="setlang", description="設定語言頻道")
+@bot.tree.command(name="addlang", description="設定語言頻道")
 @app_commands.describe(
     lang_code="語言代碼（例如 zh-TW, en, ja, ko）",
     channel="目標頻道（留空表示目前頻道）",
 )
 @app_commands.checks.has_permissions(manage_channels=True)
-async def slash_setlang(
+async def slash_addlang(
     interaction: discord.Interaction,
     lang_code: str,
     channel: discord.TextChannel = None,
@@ -599,10 +733,10 @@ async def slash_setlang(
     )
 
 
-@bot.tree.command(name="unsetlang", description="取消語言頻道設定")
+@bot.tree.command(name="removelang", description="取消語言頻道設定")
 @app_commands.describe(channel="目標頻道（留空表示目前頻道）")
 @app_commands.checks.has_permissions(manage_channels=True)
-async def slash_unsetlang(
+async def slash_removelang(
     interaction: discord.Interaction,
     channel: discord.TextChannel = None,
 ):
@@ -673,6 +807,35 @@ async def slash_removeterm(
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+@bot.tree.command(name="addproper", description="新增專有名詞（在所有語言頻道保留原文，不翻譯）")
+@app_commands.describe(word="要保留原文的詞彙，例如人名 Jim、伺服器名稱等")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_addproper(interaction: discord.Interaction, word: str):
+    guild_id = str(interaction.guild_id)
+    if guild_id not in _glossary_data:
+        _glossary_data[guild_id] = {}
+    _glossary_data[guild_id][word] = {"*": word}
+    save_glossary(_glossary_data)
+    await interaction.response.send_message(
+        f"已新增專有名詞：`{word}`（所有語言頻道皆保留原文）", ephemeral=True
+    )
+
+
+@bot.tree.command(name="removeproper", description="移除專有名詞")
+@app_commands.describe(word="要移除的專有名詞")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_removeproper(interaction: discord.Interaction, word: str):
+    guild_id = str(interaction.guild_id)
+    guild_terms = _glossary_data.get(guild_id, {})
+    entry = guild_terms.get(word)
+    if not entry or "*" not in entry:
+        await interaction.response.send_message(f"找不到專有名詞 `{word}`。", ephemeral=True)
+        return
+    del guild_terms[word]
+    save_glossary(_glossary_data)
+    await interaction.response.send_message(f"已移除專有名詞：`{word}`。", ephemeral=True)
+
+
 @bot.tree.command(name="listterms", description="列出所有詞彙表條目")
 async def slash_listterms(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
@@ -680,23 +843,80 @@ async def slash_listterms(interaction: discord.Interaction):
     if not terms:
         await interaction.response.send_message("詞彙表目前是空的。", ephemeral=True)
         return
-    lines = []
+
+    proper_lines: list[str] = []
+    term_lines: list[str] = []
     for word, translations in terms.items():
-        pairs = "、".join(f"{lang}: {t}" for lang, t in translations.items())
-        lines.append(f"`{word}` → {pairs}")
+        if "*" in translations:
+            proper_lines.append(f"`{word}`")
+        else:
+            pairs = "、".join(f"{lang}: {t}" for lang, t in translations.items())
+            term_lines.append(f"`{word}` → {pairs}")
+
+    embed = discord.Embed(title="詞彙表", color=discord.Color.blue())
+    if proper_lines:
+        embed.add_field(name="專有名詞（不翻譯）", value="\n".join(proper_lines), inline=False)
+    if term_lines:
+        embed.add_field(name="翻譯詞彙", value="\n".join(term_lines), inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="addsub", description="新增翻譯前替換規則（來源文字替換後再翻譯）")
+@app_commands.describe(
+    word="要被替換的來源文字",
+    replacement="替換成的文字",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_addsub(interaction: discord.Interaction, word: str, replacement: str):
+    guild_id = str(interaction.guild_id)
+    if guild_id not in _substitutions_data:
+        _substitutions_data[guild_id] = {}
+    _substitutions_data[guild_id][word] = replacement
+    save_substitutions(_substitutions_data)
+    await interaction.response.send_message(
+        f"已新增替換規則：`{word}` → `{replacement}`（翻譯前替換）", ephemeral=True
+    )
+
+
+@bot.tree.command(name="removesub", description="移除翻譯前替換規則")
+@app_commands.describe(word="要移除的來源文字")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_removesub(interaction: discord.Interaction, word: str):
+    guild_id = str(interaction.guild_id)
+    guild_subs = _substitutions_data.get(guild_id, {})
+    if word not in guild_subs:
+        await interaction.response.send_message(f"找不到替換規則 `{word}`。", ephemeral=True)
+        return
+    del guild_subs[word]
+    save_substitutions(_substitutions_data)
+    await interaction.response.send_message(f"已移除替換規則：`{word}`。", ephemeral=True)
+
+
+@bot.tree.command(name="listsubs", description="列出所有翻譯前替換規則")
+async def slash_listsubs(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    subs = _substitutions_data.get(guild_id, {})
+    if not subs:
+        await interaction.response.send_message("目前沒有替換規則。", ephemeral=True)
+        return
+    lines = [f"`{word}` → `{rep}`" for word, rep in subs.items()]
     embed = discord.Embed(
-        title="詞彙表",
+        title="翻譯前替換規則",
         description="\n".join(lines),
-        color=discord.Color.blue(),
+        color=discord.Color.orange(),
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # Slash command error handlers
-@slash_setlang.error
-@slash_unsetlang.error
+@slash_addlang.error
+@slash_removelang.error
 @slash_addterm.error
 @slash_removeterm.error
+@slash_addproper.error
+@slash_removeproper.error
+@slash_addsub.error
+@slash_removesub.error
 async def _perm_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("需要「管理頻道」權限。", ephemeral=True)
@@ -743,7 +963,7 @@ async def _do_unsetlang(guild_id: int, target: discord.TextChannel, respond) -> 
 async def _do_listlang(guild_id: int, respond) -> None:
     guild_channels = channel_configs.get(guild_id, {})
     if not guild_channels:
-        await respond("No language channels registered. Use `/setlang` to add one.")
+        await respond("No language channels registered. Use `/addlang` to add one.")
         return
     lines = []
     for ch_id, info in guild_channels.items():
