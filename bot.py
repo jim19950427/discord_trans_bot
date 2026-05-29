@@ -61,8 +61,10 @@ async def on_message(message: discord.Message):
     source_lang = source_info["lang"]
     content = message.content.strip()
     attachments = message.attachments
+    # Only forward stickers that can be rendered as images (skip Lottie JSON format)
+    stickers = [s for s in message.stickers if s.format != discord.StickerFormatType.lottie]
 
-    if not content and not attachments:
+    if not content and not attachments and not stickers:
         return
 
     username = message.author.display_name
@@ -88,7 +90,7 @@ async def on_message(message: discord.Message):
             _translate_and_send(
                 content, source_lang, target_lang,
                 webhook_url, username, avatar_url,
-                list(attachments), quoted, quoted_author,
+                list(attachments), stickers, quoted, quoted_author,
             )
         )
         target_channel_ids.append(channel_id)
@@ -120,6 +122,7 @@ async def _translate_and_send(
     username: str,
     avatar_url: str,
     attachments: list,
+    stickers: list,
     quoted_content: str | None,
     quoted_author: str | None = None,
 ) -> tuple[int, str] | None:
@@ -127,17 +130,21 @@ async def _translate_and_send(
     if text:
         translated = await asyncio.to_thread(translate_text, text, src, dest)
 
-    # Download attachments so they can be re-uploaded via the webhook
+    # Download attachments and stickers so they can be re-uploaded via the webhook
     files: list[discord.File] = []
-    for att in attachments:
+    urls: list[tuple[str, str]] = (
+        [(att.url, att.filename) for att in attachments]
+        + [(s.url, f"{s.name}.{'gif' if s.format == discord.StickerFormatType.gif else 'png'}") for s in stickers]
+    )
+    for url, filename in urls:
         try:
             async with aiohttp.ClientSession() as dl:
-                async with dl.get(att.url) as resp:
+                async with dl.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.read()
-                        files.append(discord.File(io.BytesIO(data), filename=att.filename))
+                        files.append(discord.File(io.BytesIO(data), filename=filename))
         except Exception as e:
-            print(f"Attachment download failed ({att.filename}): {e}")
+            print(f"Download failed ({filename}): {e}")
 
     if not translated and not files:
         return None
