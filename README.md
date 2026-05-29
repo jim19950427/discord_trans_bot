@@ -2,6 +2,8 @@
 
 自動橋接多個語言頻道。任何人在語言頻道發訊息，機器人會以**該用戶的名稱與頭像**，將翻譯後的內容同步發送到其他所有語言頻道。
 
+**[➕ 點此將機器人加入你的伺服器](https://discord.com/oauth2/authorize?client_id=1509841382242648154&permissions=536963136&integration_type=0&scope=bot+applications.commands)**
+
 ## 運作方式
 
 ```
