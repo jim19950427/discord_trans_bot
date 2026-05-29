@@ -38,7 +38,9 @@ def _try_google(text: str, source: str, target: str) -> str | None:
     for attempt in range(3):
         try:
             result = GoogleTranslator(source=source, target=target).translate(text)
-            if result:
+            # Treat result == input as a failed translation (deep-translator bug
+            # where auto-detect returns the original text unchanged)
+            if result and result.strip() != text.strip():
                 return result
         except Exception as e:
             err = str(e).lower()
@@ -68,7 +70,6 @@ def _try_mymemory(text: str, src: str, dest: str) -> str | None:
 @lru_cache(maxsize=2000)
 def _cached_translate(text: str, src: str, dest: str) -> str | None:
     """Translate with LRU cache. Tries auto-detect first, then declared source, then MyMemory."""
-    print(f"[translate] ({src}->{dest}) input: {repr(text)}")
     result = _try_google(text, "auto", dest)
     if not result:
         result = _try_google(text, src, dest)
@@ -76,7 +77,6 @@ def _cached_translate(text: str, src: str, dest: str) -> str | None:
         result = _try_mymemory(text, src, dest)
         if result:
             print(f"MyMemory fallback used ({src} -> {dest})")
-    print(f"[translate] ({src}->{dest}) output: {repr(result)}")
     return result
 
 
