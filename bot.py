@@ -81,8 +81,7 @@ async def on_ready():
             ch = bot.get_channel(ch_id)
             if isinstance(ch, discord.TextChannel):
                 try:
-                    pins = await ch.pins()
-                    _channel_pins[ch_id] = {m.id for m in pins}
+                    _channel_pins[ch_id] = {m.id async for m in ch.pins()}
                 except discord.HTTPException:
                     _channel_pins[ch_id] = set()
 
@@ -456,11 +455,9 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
     if channel.id not in guild_channels:
         return
     try:
-        pins = await channel.pins()
+        current_ids = {m.id async for m in channel.pins()}
     except discord.HTTPException:
         return
-
-    current_ids = {m.id for m in pins}
     prev_ids = _channel_pins.get(channel.id, set())
     _channel_pins[channel.id] = current_ids
 
