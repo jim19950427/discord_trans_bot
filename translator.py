@@ -1,7 +1,7 @@
 import re
 import time
 from functools import lru_cache
-from deep_translator import GoogleTranslator, MyMemoryTranslator
+from deep_translator import GoogleTranslator
 
 # Build a lowercase-keyed lookup so user input like "zh-tw" maps to "zh-TW"
 _SUPPORTED: dict[str, str] = {
@@ -13,76 +13,47 @@ _SUPPORTED: dict[str, str] = {
 _CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
 # Matches any real word character (letters/digits from any script, incl. CJK)
 _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
-# HTML tags that MyMemory sometimes injects into results
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-
-# MyMemory uses locale codes; map common lang codes to them
-_MYMEMORY_MAP: dict[str, str] = {
-    "af": "af-ZA", "ar": "ar-SA", "bg": "bg-BG", "cs": "cs-CZ",
-    "da": "da-DK", "de": "de-DE", "el": "el-GR", "en": "en-US",
-    "es": "es-ES", "et": "et-EE", "fi": "fi-FI", "fr": "fr-FR",
-    "he": "he-IL", "hi": "hi-IN", "hr": "hr-HR", "hu": "hu-HU",
-    "id": "id-ID", "it": "it-IT", "ja": "ja-JP", "ko": "ko-KR",
-    "lt": "lt-LT", "lv": "lv-LV", "ms": "ms-MY", "nl": "nl-NL",
-    "no": "no-NO", "pl": "pl-PL", "pt": "pt-PT", "ro": "ro-RO",
-    "ru": "ru-RU", "sk": "sk-SK", "sl": "sl-SI", "sr": "sr-RS",
-    "sv": "sv-SE", "th": "th-TH", "tr": "tr-TR", "uk": "uk-UA",
-    "vi": "vi-VN", "zh-CN": "zh-CN", "zh-TW": "zh-TW",
-}
 
 
 def normalize_lang(code: str) -> str:
     return _SUPPORTED.get(code.lower(), code)
 
 
-def _try_google(text: str, source: str, target: str) -> str | None:
-    """Call Google Translate with up to 3 retries on rate-limit errors."""
-    for attempt in range(3):
+def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | None:
+    """Call Google Translate with retries for both rate-limit errors and untranslated results."""
+    for attempt in range(retries):
         try:
             result = GoogleTranslator(source=source, target=target).translate(text)
-            # Treat result == input as a failed translation (deep-translator bug
-            # where auto-detect returns the original text unchanged)
             if result and result.strip() != text.strip():
                 return result
+            # Result equals input — Google returned original text unchanged.
+            # Wait and retry; this is usually a temporary API issue.
+            if attempt < retries - 1:
+                wait = 2 ** attempt  # 1 s, 2 s, 4 s
+                print(f"[translate] result==input ({source}->{target}) attempt {attempt+1}, retrying in {wait}s")
+                time.sleep(wait)
         except Exception as e:
             err = str(e).lower()
             if any(k in err for k in ("429", "too many", "rate limit", "quota")):
-                if attempt < 2:
-                    time.sleep(2 ** attempt)  # 1 s, 2 s
+                if attempt < retries - 1:
+                    wait = 2 ** attempt
+                    print(f"[translate] rate limit ({source}->{target}) attempt {attempt+1}, retrying in {wait}s")
+                    time.sleep(wait)
                 continue
             print(f"Google Translate error (source={source}, target={target}): {e}")
             break
     return None
 
 
-def _try_mymemory(text: str, src: str, dest: str) -> str | None:
-    """MyMemory fallback for languages present in _MYMEMORY_MAP."""
-    mm_src = _MYMEMORY_MAP.get(src)
-    mm_dest = _MYMEMORY_MAP.get(dest)
-    if not mm_src or not mm_dest:
-        return None
-    try:
-        result = MyMemoryTranslator(source=mm_src, target=mm_dest).translate(text)
-        if result:
-            result = _HTML_TAG_RE.sub("", result).strip()
-        if result and result.strip() != text.strip():
-            return result
-        return None
-    except Exception as e:
-        print(f"MyMemory fallback error ({src} -> {dest}): {e}")
-        return None
-
-
 @lru_cache(maxsize=2000)
 def _cached_translate(text: str, src: str, dest: str) -> str | None:
-    """Translate with LRU cache. Tries auto-detect first, then declared source, then MyMemory."""
-    result = _try_google(text, "auto", dest)
+    print(f"[translate] ({src}->{dest}) input: {repr(text)}")
+    # Try explicit source first — more reliable for CJK languages
+    result = _try_google(text, src, dest)
     if not result:
-        result = _try_google(text, src, dest)
-    if not result:
-        result = _try_mymemory(text, src, dest)
-        if result:
-            print(f"MyMemory fallback used ({src} -> {dest})")
+        # Auto-detect as secondary attempt
+        result = _try_google(text, "auto", dest)
+    print(f"[translate] ({src}->{dest}) output: {repr(result)}")
     return result
 
 
@@ -143,16 +114,14 @@ def translate_text(
 
         if placeholder_map:
             line_result = (
-                _try_google(segment, "auto", dest)
-                or _try_google(segment, src, dest)
-                or _try_mymemory(segment, src, dest)
+                _try_google(segment, src, dest)
+                or _try_google(segment, "auto", dest)
             )
         else:
             line_result = _cached_translate(segment, src, dest)
 
         if not line_result:
-            # Both engines failed — keep original text for this line
-            print(f"Translation failed ({src}->{dest}): {repr(line_stripped)}")
+            print(f"[translate] all attempts failed ({src}->{dest}): {repr(line_stripped)}")
             translated_lines.append(line_stripped)
             continue
 
