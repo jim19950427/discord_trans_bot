@@ -238,5 +238,6 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 | `id` | Bahasa Indonesia |
 | `ru` | Русский |
 | `ar` | العربية |
+| `pl` | Polski |
 
 完整語言代碼清單請參考：https://py-googletrans.readthedocs.io/en/latest/
