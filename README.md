@@ -244,17 +244,17 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 |------|------|
 | `zh-TW` | 繁體中文 |
 | `zh-CN` | 簡體中文 |
-| `en` | English |
-| `ja` | 日本語 |
-| `ko` | 한국어 |
-| `fr` | Français |
-| `de` | Deutsch |
-| `es` | Español |
-| `vi` | Tiếng Việt |
-| `th` | ภาษาไทย |
-| `id` | Bahasa Indonesia |
-| `ru` | Русский |
-| `ar` | العربية |
-| `pl` | Polski |
+| `en` | English 英文 |
+| `ja` | 日本語 日文 |
+| `ko` | 한국어 韓文 |
+| `fr` | Français 法文 |
+| `de` | Deutsch 德文 |
+| `es` | Español 西班牙文 |
+| `vi` | Tiếng Việt 越南文 |
+| `th` | ภาษาไทย 泰文 |
+| `id` | Bahasa Indonesia 印尼文 |
+| `ru` | Русский 俄文 |
+| `ar` | العربية 阿拉伯文 |
+| `pl` | Polski 波蘭文 |
 
 完整語言代碼清單請參考：https://py-googletrans.readthedocs.io/en/latest/
