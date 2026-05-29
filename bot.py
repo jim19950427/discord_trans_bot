@@ -673,6 +673,35 @@ async def slash_removeterm(
     await interaction.response.send_message(msg, ephemeral=True)
 
 
+@bot.tree.command(name="addproper", description="新增專有名詞（在所有語言頻道保留原文，不翻譯）")
+@app_commands.describe(word="要保留原文的詞彙，例如人名 Jim、伺服器名稱等")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_addproper(interaction: discord.Interaction, word: str):
+    guild_id = str(interaction.guild_id)
+    if guild_id not in _glossary_data:
+        _glossary_data[guild_id] = {}
+    _glossary_data[guild_id][word] = {"*": word}
+    save_glossary(_glossary_data)
+    await interaction.response.send_message(
+        f"已新增專有名詞：`{word}`（所有語言頻道皆保留原文）", ephemeral=True
+    )
+
+
+@bot.tree.command(name="removeproper", description="移除專有名詞")
+@app_commands.describe(word="要移除的專有名詞")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_removeproper(interaction: discord.Interaction, word: str):
+    guild_id = str(interaction.guild_id)
+    guild_terms = _glossary_data.get(guild_id, {})
+    entry = guild_terms.get(word)
+    if not entry or "*" not in entry:
+        await interaction.response.send_message(f"找不到專有名詞 `{word}`。", ephemeral=True)
+        return
+    del guild_terms[word]
+    save_glossary(_glossary_data)
+    await interaction.response.send_message(f"已移除專有名詞：`{word}`。", ephemeral=True)
+
+
 @bot.tree.command(name="listterms", description="列出所有詞彙表條目")
 async def slash_listterms(interaction: discord.Interaction):
     guild_id = str(interaction.guild_id)
@@ -680,15 +709,21 @@ async def slash_listterms(interaction: discord.Interaction):
     if not terms:
         await interaction.response.send_message("詞彙表目前是空的。", ephemeral=True)
         return
-    lines = []
+
+    proper_lines: list[str] = []
+    term_lines: list[str] = []
     for word, translations in terms.items():
-        pairs = "、".join(f"{lang}: {t}" for lang, t in translations.items())
-        lines.append(f"`{word}` → {pairs}")
-    embed = discord.Embed(
-        title="詞彙表",
-        description="\n".join(lines),
-        color=discord.Color.blue(),
-    )
+        if "*" in translations:
+            proper_lines.append(f"`{word}`")
+        else:
+            pairs = "、".join(f"{lang}: {t}" for lang, t in translations.items())
+            term_lines.append(f"`{word}` → {pairs}")
+
+    embed = discord.Embed(title="詞彙表", color=discord.Color.blue())
+    if proper_lines:
+        embed.add_field(name="專有名詞（不翻譯）", value="\n".join(proper_lines), inline=False)
+    if term_lines:
+        embed.add_field(name="翻譯詞彙", value="\n".join(term_lines), inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -697,6 +732,8 @@ async def slash_listterms(interaction: discord.Interaction):
 @slash_unsetlang.error
 @slash_addterm.error
 @slash_removeterm.error
+@slash_addproper.error
+@slash_removeproper.error
 async def _perm_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("需要「管理頻道」權限。", ephemeral=True)

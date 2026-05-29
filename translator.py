@@ -58,13 +58,23 @@ def _cached_translate(text: str, src: str, dest: str) -> str | None:
 
 
 def _apply_glossary(text: str, dest: str, glossary: dict) -> tuple[str, dict[str, str]]:
-    """Replace source terms with §N§ placeholders so they survive translation."""
+    """Replace source terms with §N§ placeholders so they survive translation.
+
+    translations["*"] = original term means "keep as-is in all languages" (proper noun).
+    """
     placeholder_map: dict[str, str] = {}
     for idx, (term, translations) in enumerate(glossary.items()):
-        if term in text and dest in translations:
-            ph = f"§{idx}§"
-            text = text.replace(term, ph)
-            placeholder_map[ph] = translations[dest]
+        if term not in text:
+            continue
+        if dest in translations:
+            replacement = translations[dest]
+        elif "*" in translations:
+            replacement = translations["*"]
+        else:
+            continue
+        ph = f"§{idx}§"
+        text = text.replace(term, ph)
+        placeholder_map[ph] = replacement
     return text, placeholder_map
 
 
