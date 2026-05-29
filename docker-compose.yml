@@ -9,7 +9,9 @@ services:
       - ./bot.py:/app/bot.py
       - ./translator.py:/app/translator.py
       - ./config.py:/app/config.py
+      - ./glossary.py:/app/glossary.py
       # 頻道設定持久化
       - ./data:/data
     environment:
       - CONFIG_FILE=/data/channel_config.json
+      - GLOSSARY_FILE=/data/glossary.json
