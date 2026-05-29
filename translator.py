@@ -68,7 +68,7 @@ def _try_mymemory(text: str, src: str, dest: str) -> str | None:
 @lru_cache(maxsize=2000)
 def _cached_translate(text: str, src: str, dest: str) -> str | None:
     """Translate with LRU cache. Tries auto-detect first, then declared source, then MyMemory."""
-    # Auto-detect is more robust than declared source for mixed-language text
+    print(f"[translate] ({src}->{dest}) input: {repr(text)}")
     result = _try_google(text, "auto", dest)
     if not result:
         result = _try_google(text, src, dest)
@@ -76,6 +76,7 @@ def _cached_translate(text: str, src: str, dest: str) -> str | None:
         result = _try_mymemory(text, src, dest)
         if result:
             print(f"MyMemory fallback used ({src} -> {dest})")
+    print(f"[translate] ({src}->{dest}) output: {repr(result)}")
     return result
 
 
