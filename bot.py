@@ -114,6 +114,29 @@ async def on_message(message: discord.Message):
     _store_cluster(cluster)
 
 
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.user_id == bot.user.id:
+        return
+
+    cluster = _msg_clusters.get(payload.message_id)
+    if not cluster:
+        return
+
+    emoji = payload.emoji
+    for channel_id, msg_id in cluster["channels"].items():
+        if msg_id == payload.message_id:
+            continue
+        channel = bot.get_channel(channel_id)
+        if not channel:
+            continue
+        try:
+            msg = await channel.fetch_message(msg_id)
+            await msg.add_reaction(emoji)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            print(f"Failed to sync reaction in channel {channel_id}: {e}")
+
+
 async def _translate_and_send(
     text: str,
     src: str,

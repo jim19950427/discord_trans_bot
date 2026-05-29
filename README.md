@@ -50,6 +50,7 @@ B 在 #english 輸入「Good morning」
    - `Send Messages`
    - `Read Message History`
    - `Manage Webhooks`（**必須**，機器人會自動在頻道建立 Webhook）
+   - `Add Reactions`（**必須**，用於同步各頻道的 Reaction）
    - `Embed Links`
 4. 複製頁面下方產生的 URL，在瀏覽器開啟，選擇你的伺服器並授權
 
