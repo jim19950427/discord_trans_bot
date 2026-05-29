@@ -9,6 +9,8 @@ _SUPPORTED: dict[str, str] = {
 
 # Discord custom emoji: <:name:id> or animated <a:name:id>
 _CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+# Matches any real word character (letters/digits from any script, incl. CJK)
+_HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
 
 
 def normalize_lang(code: str) -> str:
@@ -28,6 +30,11 @@ def translate_text(text: str, source_lang: str, target_lang: str) -> str | None:
     # Message is only custom emojis; forward verbatim, nothing to translate
     if not clean:
         return text if emojis else None
+
+    # If clean text has no actual words/letters (e.g. only Unicode emoji like 👀),
+    # forward the original as-is — Google Translate would mangle or drop them
+    if not _HAS_WORD_RE.search(clean):
+        return text
 
     # Try with the declared source first, then fall back to auto-detect
     # (handles mixed-language messages like "oi 這個不行？")
