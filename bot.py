@@ -181,6 +181,44 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
 
 @bot.event
+async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    cluster = _msg_clusters.pop(payload.message_id, None)
+    if not cluster:
+        return
+
+    guild_channels = {}
+    for guild in bot.guilds:
+        if payload.channel_id in channel_configs.get(guild.id, {}):
+            guild_channels = channel_configs[guild.id]
+            break
+
+    tasks = []
+    for ch_id, msg_id in cluster["channels"].items():
+        if msg_id == payload.message_id:
+            continue
+        info = guild_channels.get(ch_id)
+        if not info or not info.get("webhook_url"):
+            continue
+        tasks.append(_delete_webhook_message(info["webhook_url"], msg_id, ch_id))
+
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    # Remove all cluster entries for this group
+    for msg_id in list(cluster["channels"].values()):
+        _msg_clusters.pop(msg_id, None)
+
+
+async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> None:
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            await webhook.delete_message(msg_id)
+    except Exception as e:
+        print(f"Failed to delete webhook message {msg_id} in channel {ch_id}: {e}")
+
+
+@bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.user_id == bot.user.id:
         return
