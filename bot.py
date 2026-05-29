@@ -4,7 +4,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
-from translator import translate_text
+from translator import translate_text, normalize_lang
 from config import load_channel_config, save_channel_config
 
 load_dotenv()
@@ -89,12 +89,13 @@ async def set_lang(ctx: commands.Context, lang_code: str, channel: discord.TextC
     if guild_id not in channel_configs:
         channel_configs[guild_id] = {}
 
+    normalized = normalize_lang(lang_code)
     channel_configs[guild_id][target.id] = {
-        "lang": lang_code.lower(),
+        "lang": normalized,
         "webhook_url": webhook.url,
     }
     save_channel_config(channel_configs)
-    await ctx.send(f"Set {target.mention} as the `{lang_code}` language channel.")
+    await ctx.send(f"Set {target.mention} as the `{normalized}` language channel.")
 
 
 @bot.command(name="unsetlang")
