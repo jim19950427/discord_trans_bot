@@ -118,25 +118,42 @@ def translate_text(
     if not _HAS_WORD_RE.search(clean):
         return text
 
-    placeholder_map: dict[str, str] = {}
-    if glossary:
-        clean, placeholder_map = _apply_glossary(clean, dest, glossary)
+    # Split by newlines and translate each line independently to avoid a
+    # deep-translator / unofficial Google API bug where only the first line
+    # gets translated when the input contains newlines.
+    lines = clean.splitlines()
+    translated_lines: list[str] = []
+    for line in lines:
+        line_stripped = line.strip()
+        if not line_stripped or not _HAS_WORD_RE.search(line_stripped):
+            translated_lines.append(line)
+            continue
 
-    if placeholder_map:
-        # Bypass cache when placeholders are present (text is modified)
-        result = (
-            _try_google(clean, "auto", dest)
-            or _try_google(clean, src, dest)
-            or _try_mymemory(clean, src, dest)
-        )
-    else:
-        result = _cached_translate(clean, src, dest)
+        placeholder_map: dict[str, str] = {}
+        segment = line_stripped
+        if glossary:
+            segment, placeholder_map = _apply_glossary(segment, dest, glossary)
 
+        if placeholder_map:
+            line_result = (
+                _try_google(segment, "auto", dest)
+                or _try_google(segment, src, dest)
+                or _try_mymemory(segment, src, dest)
+            )
+        else:
+            line_result = _cached_translate(segment, src, dest)
+
+        if not line_result:
+            return None
+
+        if placeholder_map:
+            line_result = _restore_glossary(line_result, placeholder_map)
+
+        translated_lines.append(line_result)
+
+    result = "\n".join(translated_lines)
     if not result:
         return None
-
-    if placeholder_map:
-        result = _restore_glossary(result, placeholder_map)
 
     if emojis:
         result = result + "  " + " ".join(emojis)
