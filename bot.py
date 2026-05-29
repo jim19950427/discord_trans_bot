@@ -105,13 +105,79 @@ async def on_message(message: discord.Message):
         "channels": {message.channel.id: message.id},
         "contents": {message.channel.id: content},
         "author": username,
+        "prefixes": {},  # reply blockquote prefix per channel, for edit reconstruction
     }
     for ch_id, result in zip(target_channel_ids, results):
         if result is not None:
             sent_id, sent_text = result
             cluster["channels"][ch_id] = sent_id
             cluster["contents"][ch_id] = sent_text or ""
+
+    # Store the reply prefix so edits can reconstruct the blockquote header
+    if ref_cluster:
+        ref_author = ref_cluster.get("author", "")
+        for ch_id in target_channel_ids:
+            quoted = ref_cluster["contents"].get(ch_id, "")
+            if quoted:
+                lines = quoted.splitlines()
+                pl: list[str] = []
+                if ref_author and lines:
+                    pl.append(f"> **{ref_author}**: {lines[0]}")
+                    pl.extend(f"> {l}" for l in lines[1:])
+                else:
+                    pl.extend(f"> {l}" for l in lines)
+                cluster["prefixes"][ch_id] = "\n".join(pl)
+
     _store_cluster(cluster)
+
+
+@bot.event
+async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
+    channel = bot.get_channel(payload.channel_id)
+    if not channel or not hasattr(channel, "guild"):
+        return
+
+    guild_channels = channel_configs.get(channel.guild.id, {})
+    if payload.channel_id not in guild_channels:
+        return
+
+    cluster = _msg_clusters.get(payload.message_id)
+    if not cluster:
+        return
+
+    try:
+        message = await channel.fetch_message(payload.message_id)
+    except (discord.NotFound, discord.HTTPException):
+        return
+
+    if message.author.bot:
+        return
+
+    new_content = message.content.strip()
+    if not new_content:
+        return
+
+    source_lang = guild_channels[payload.channel_id]["lang"]
+
+    edit_targets = [
+        (ch_id, msg_id, guild_channels[ch_id]["lang"], guild_channels[ch_id]["webhook_url"])
+        for ch_id, msg_id in cluster["channels"].items()
+        if ch_id != payload.channel_id
+        and ch_id in guild_channels
+        and guild_channels[ch_id].get("webhook_url")
+    ]
+
+    tasks = [
+        _translate_and_edit(new_content, source_lang, lang, webhook_url, msg_id, ch_id, cluster)
+        for ch_id, msg_id, lang, webhook_url in edit_targets
+    ]
+
+    if tasks:
+        edit_results = await asyncio.gather(*tasks)
+        cluster["contents"][payload.channel_id] = new_content
+        for (ch_id, _, _, _), translated in zip(edit_targets, edit_results):
+            if translated:
+                cluster["contents"][ch_id] = translated
 
 
 @bot.event
@@ -135,6 +201,33 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             await msg.add_reaction(emoji)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             print(f"Failed to sync reaction in channel {channel_id}: {e}")
+
+
+async def _translate_and_edit(
+    text: str,
+    src: str,
+    dest: str,
+    webhook_url: str,
+    msg_id: int,
+    ch_id: int,
+    cluster: dict,
+) -> str | None:
+    translated = await asyncio.to_thread(translate_text, text, src, dest)
+    if not translated:
+        return None
+
+    prefix = cluster.get("prefixes", {}).get(ch_id, "")
+    full_content = f"{prefix}\n{translated}" if prefix else translated
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            await webhook.edit_message(msg_id, content=full_content)
+    except Exception as e:
+        print(f"Failed to edit webhook message {msg_id} in channel {ch_id}: {e}")
+        return None
+
+    return translated
 
 
 async def _translate_and_send(
