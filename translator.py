@@ -106,11 +106,17 @@ def translate_text(
     source_lang: str,
     target_lang: str,
     glossary: dict | None = None,
+    substitutions: dict | None = None,
 ) -> str | None:
     src = normalize_lang(source_lang)
     dest = normalize_lang(target_lang)
     if src == dest:
         return None
+
+    # Apply pre-translation substitutions (e.g. aliases / euphemisms)
+    if substitutions:
+        for src_term, replacement in substitutions.items():
+            text = text.replace(src_term, replacement)
 
     # Pull out custom Discord emojis — Google Translate chokes on <:name:id> syntax
     emojis = _CUSTOM_EMOJI_RE.findall(text)

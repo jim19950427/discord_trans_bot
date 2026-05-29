@@ -8,7 +8,10 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from translator import translate_text, normalize_lang
 from config import load_channel_config, save_channel_config
-from glossary import load_glossary, save_glossary, get_guild_glossary
+from glossary import (
+    load_glossary, save_glossary, get_guild_glossary,
+    load_substitutions, save_substitutions, get_guild_substitutions,
+)
 
 load_dotenv()
 
@@ -24,6 +27,9 @@ channel_configs: dict[int, dict[int, dict]] = {}
 
 # {str(guild_id): {source_term: {target_lang: translation}}}
 _glossary_data: dict = {}
+
+# {str(guild_id): {source_term: replacement}}
+_substitutions_data: dict = {}
 
 WEBHOOK_NAME = "TranslationBot"
 NO_TRANSLATE_PREFIX = "//"
@@ -70,9 +76,10 @@ def _guild_channels_for(channel_id: int) -> dict:
 
 @bot.event
 async def on_ready():
-    global channel_configs, _glossary_data
+    global channel_configs, _glossary_data, _substitutions_data
     channel_configs = load_channel_config()
     _glossary_data = load_glossary()
+    _substitutions_data = load_substitutions()
 
     # Pre-populate pin cache so the first pin event doesn't treat all existing
     # pins as newly added (which would cause spurious sync attempts).
@@ -130,6 +137,7 @@ async def on_message(message: discord.Message):
     username = message.author.display_name
     avatar_url = str(message.author.display_avatar.url)
     guild_glossary = get_guild_glossary(message.guild.id, _glossary_data)
+    guild_substitutions = get_guild_substitutions(message.guild.id, _substitutions_data)
 
     ref_cluster = None
     if message.reference and message.reference.message_id:
@@ -155,7 +163,7 @@ async def on_message(message: discord.Message):
                 content, source_lang, target_lang,
                 webhook_url, username, avatar_url,
                 attachments, stickers, quoted, quoted_author,
-                guild_glossary,
+                guild_glossary, guild_substitutions,
             )
         )
         target_channel_ids.append(channel_id)
@@ -246,6 +254,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
     source_lang = guild_channels[payload.channel_id]["lang"]
     guild_glossary = get_guild_glossary(channel.guild.id, _glossary_data)
+    guild_substitutions = get_guild_substitutions(channel.guild.id, _substitutions_data)
 
     edit_targets = [
         (ch_id, msg_id, guild_channels[ch_id]["lang"], guild_channels[ch_id]["webhook_url"])
@@ -287,7 +296,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                 wh_url, cluster["author"], cluster["avatar_url"],
                 current_attachments, current_stickers,
                 cluster.get("prefixes", {}).get(ch_id),
-                None, guild_glossary,
+                None, guild_glossary, guild_substitutions,
             )
             for ch_id, _, lang, wh_url in edit_targets
         ])
@@ -304,7 +313,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                 _msg_clusters[new_msg_id] = cluster
     elif new_content:
         edit_results = await asyncio.gather(*[
-            _translate_and_edit(new_content, source_lang, lang, wh_url, msg_id, ch_id, cluster, guild_glossary)
+            _translate_and_edit(new_content, source_lang, lang, wh_url, msg_id, ch_id, cluster, guild_glossary, guild_substitutions)
             for ch_id, msg_id, lang, wh_url in edit_targets
         ])
         cluster["contents"][payload.channel_id] = new_content
@@ -594,10 +603,11 @@ async def _translate_and_send(
     quoted_content: str | None,
     quoted_author: str | None = None,
     glossary: dict | None = None,
+    substitutions: dict | None = None,
 ) -> tuple[int, str] | None:
     translated: str | None = None
     if text:
-        translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {})
+        translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {}, substitutions or {})
 
     files: list[discord.File] = []
     urls: list[tuple[str, str]] = (
@@ -650,8 +660,9 @@ async def _translate_and_edit(
     ch_id: int,
     cluster: dict,
     glossary: dict | None = None,
+    substitutions: dict | None = None,
 ) -> str | None:
-    translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {})
+    translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {}, substitutions or {})
     if not translated:
         return None
 
@@ -850,6 +861,53 @@ async def slash_listterms(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="addsub", description="新增翻譯前替換規則（來源文字替換後再翻譯）")
+@app_commands.describe(
+    word="要被替換的來源文字",
+    replacement="替換成的文字",
+)
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_addsub(interaction: discord.Interaction, word: str, replacement: str):
+    guild_id = str(interaction.guild_id)
+    if guild_id not in _substitutions_data:
+        _substitutions_data[guild_id] = {}
+    _substitutions_data[guild_id][word] = replacement
+    save_substitutions(_substitutions_data)
+    await interaction.response.send_message(
+        f"已新增替換規則：`{word}` → `{replacement}`（翻譯前替換）", ephemeral=True
+    )
+
+
+@bot.tree.command(name="removesub", description="移除翻譯前替換規則")
+@app_commands.describe(word="要移除的來源文字")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_removesub(interaction: discord.Interaction, word: str):
+    guild_id = str(interaction.guild_id)
+    guild_subs = _substitutions_data.get(guild_id, {})
+    if word not in guild_subs:
+        await interaction.response.send_message(f"找不到替換規則 `{word}`。", ephemeral=True)
+        return
+    del guild_subs[word]
+    save_substitutions(_substitutions_data)
+    await interaction.response.send_message(f"已移除替換規則：`{word}`。", ephemeral=True)
+
+
+@bot.tree.command(name="listsubs", description="列出所有翻譯前替換規則")
+async def slash_listsubs(interaction: discord.Interaction):
+    guild_id = str(interaction.guild_id)
+    subs = _substitutions_data.get(guild_id, {})
+    if not subs:
+        await interaction.response.send_message("目前沒有替換規則。", ephemeral=True)
+        return
+    lines = [f"`{word}` → `{rep}`" for word, rep in subs.items()]
+    embed = discord.Embed(
+        title="翻譯前替換規則",
+        description="\n".join(lines),
+        color=discord.Color.orange(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # Slash command error handlers
 @slash_setlang.error
 @slash_unsetlang.error
@@ -857,6 +915,8 @@ async def slash_listterms(interaction: discord.Interaction):
 @slash_removeterm.error
 @slash_addproper.error
 @slash_removeproper.error
+@slash_addsub.error
+@slash_removesub.error
 async def _perm_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("需要「管理頻道」權限。", ephemeral=True)
