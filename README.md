@@ -240,21 +240,21 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 
 ## 七、語言代碼參考
 
-| 代碼 | 語言 |
-|------|------|
-| `zh-TW` | 繁體中文 |
-| `zh-CN` | 簡體中文 |
-| `en` | English 英文 |
-| `ja` | 日本語 日文 |
-| `ko` | 한국어 韓文 |
-| `fr` | Français 法文 |
-| `de` | Deutsch 德文 |
-| `es` | Español 西班牙文 |
-| `vi` | Tiếng Việt 越南文 |
-| `th` | ภาษาไทย 泰文 |
-| `id` | Bahasa Indonesia 印尼文 |
-| `ru` | Русский 俄文 |
-| `ar` | العربية 阿拉伯文 |
-| `pl` | Polski 波蘭文 |
+| 代碼 | 語言 | 中文說明 |
+|------|------|---------|
+| `zh-TW` | 繁體中文 | 繁體中文 |
+| `zh-CN` | 簡體中文 | 簡體中文 |
+| `en` | English | 英文 |
+| `ja` | 日本語 | 日文 |
+| `ko` | 한국어 | 韓文 |
+| `fr` | Français | 法文 |
+| `de` | Deutsch | 德文 |
+| `es` | Español | 西班牙文 |
+| `vi` | Tiếng Việt | 越南文 |
+| `th` | ภาษาไทย | 泰文 |
+| `id` | Bahasa Indonesia | 印尼文 |
+| `ru` | Русский | 俄文 |
+| `ar` | العربية | 阿拉伯文 |
+| `pl` | Polski | 波蘭文 |
 
 完整語言代碼清單請參考：https://py-googletrans.readthedocs.io/en/latest/
