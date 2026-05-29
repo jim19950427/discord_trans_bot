@@ -187,6 +187,23 @@ async def on_message(message: discord.Message):
 
     _store_cluster(cluster)
 
+    # Schedule a delayed retry for channels where translation failed
+    # (sent text equals original source text — translation fell back to original)
+    if not raw_forward and content:
+        for ch_id, result in zip(target_channel_ids, results):
+            if result is None:
+                continue
+            sent_id, sent_text = result
+            if sent_text.strip() == content.strip():
+                asyncio.create_task(
+                    _retry_translate(
+                        content, source_lang,
+                        guild_channels[ch_id]["lang"],
+                        guild_channels[ch_id]["webhook_url"],
+                        sent_id, ch_id, cluster, guild_glossary,
+                    )
+                )
+
 
 @bot.event
 async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
@@ -468,6 +485,34 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _retry_translate(
+    text: str,
+    src: str,
+    dest: str,
+    webhook_url: str,
+    msg_id: int,
+    ch_id: int,
+    cluster: dict,
+    glossary: dict | None = None,
+    delay: int = 10,
+) -> None:
+    await asyncio.sleep(delay)
+    translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {})
+    if not translated or translated.strip() == text.strip():
+        print(f"[retry] still failed ({src}->{dest}): {repr(text)}")
+        return
+    prefix = cluster.get("prefixes", {}).get(ch_id, "")
+    full_content = f"{prefix}\n{translated}" if prefix else translated
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            await webhook.edit_message(msg_id, content=full_content)
+        cluster["contents"][ch_id] = translated
+        print(f"[retry] updated ({src}->{dest}): {repr(translated)}")
+    except Exception as e:
+        print(f"[retry] edit failed msg={msg_id} ch={ch_id}: {e}")
+
 
 async def _raw_forward_send(
     text: str,
