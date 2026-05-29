@@ -27,6 +27,7 @@ _glossary_data: dict = {}
 
 WEBHOOK_NAME = "TranslationBot"
 NO_TRANSLATE_PREFIX = "//"
+RAW_FORWARD_PREFIX = "\\"
 
 # msg_id -> cluster dict shared by all messages in a translation group
 # cluster keys:
@@ -105,6 +106,11 @@ async def on_message(message: discord.Message):
     attachments = list(message.attachments)
     stickers = [s for s in message.stickers if s.format != discord.StickerFormatType.lottie]
 
+    # \ prefix: forward original text as-is to all channels, no translation
+    raw_forward = content.startswith(RAW_FORWARD_PREFIX)
+    if raw_forward:
+        content = content[len(RAW_FORWARD_PREFIX):].lstrip()
+
     if not content and not attachments and not stickers:
         return
 
@@ -129,6 +135,10 @@ async def on_message(message: discord.Message):
         quoted = ref_cluster["contents"].get(channel_id) if ref_cluster else None
         quoted_author = ref_cluster.get("author") if ref_cluster else None
         tasks.append(
+            _raw_forward_send(
+                content, webhook_url, username, avatar_url, attachments, stickers,
+                quoted, quoted_author,
+            ) if raw_forward else
             _translate_and_send(
                 content, source_lang, target_lang,
                 webhook_url, username, avatar_url,
@@ -458,6 +468,58 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _raw_forward_send(
+    text: str,
+    webhook_url: str,
+    username: str,
+    avatar_url: str,
+    attachments: list,
+    stickers: list,
+    quoted_content: str | None,
+    quoted_author: str | None = None,
+) -> tuple[int, str] | None:
+    files: list[discord.File] = []
+    urls: list[tuple[str, str]] = (
+        [(att.url, att.filename) for att in attachments]
+        + [(s.url, f"{s.name}.{'gif' if s.format == discord.StickerFormatType.gif else 'png'}") for s in stickers]
+    )
+    for url, filename in urls:
+        try:
+            async with aiohttp.ClientSession() as dl:
+                async with dl.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        files.append(discord.File(io.BytesIO(data), filename=filename))
+        except Exception as e:
+            print(f"Download failed ({filename}): {e}")
+
+    if not text and not files:
+        return None
+
+    parts: list[str] = []
+    if quoted_content:
+        lines = quoted_content.splitlines()
+        if quoted_author and lines:
+            parts.append(f"> **{quoted_author}**: {lines[0]}")
+            parts.extend(f"> {line}" for line in lines[1:])
+        else:
+            parts.extend(f"> {line}" for line in lines)
+    if text:
+        parts.append(text)
+    final_content = "\n".join(parts) if parts else None
+
+    send_kwargs: dict = {"username": username, "avatar_url": avatar_url, "wait": True}
+    if final_content:
+        send_kwargs["content"] = final_content
+    if files:
+        send_kwargs["files"] = files
+
+    async with aiohttp.ClientSession() as session:
+        webhook = discord.Webhook.from_url(webhook_url, session=session)
+        msg = await webhook.send(**send_kwargs)
+        return msg.id, text or ""
+
 
 async def _translate_and_send(
     text: str,
