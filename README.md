@@ -45,15 +45,17 @@ B 在 #english 輸入「Good morning」
 1. 左側選單點擊 **OAuth2** → **URL Generator**
 2. **Scopes** 勾選：
    - `bot`
+   - `applications.commands`（**必須**，用於 Slash 指令）
 3. **Bot Permissions** 勾選：
    - `傳送訊息`
    - `讀取訊息歷史記錄`
    - `管理 Webhook`（**必須**，機器人會自動在頻道建立 Webhook）
    - `新增反應`（**必須**，用於同步各頻道的 Reaction）
+   - `管理訊息`（**必須**，用於同步置頂訊息）
    - `嵌入連結`
 4. 複製頁面下方產生的 URL，在瀏覽器開啟，選擇你的伺服器並授權
 
-> **關於 Webhook**：你不需要手動建立 Webhook。當你在 Discord 執行 `!setlang` 指令時，機器人會自動在該頻道建立一個名為 `TranslationBot` 的 Webhook，並將 URL 儲存在設定檔中。這個 Webhook 讓機器人能以原始用戶的名字和頭像發送翻譯後的訊息。
+> **關於 Webhook**：你不需要手動建立 Webhook。當你執行 `/setlang` 指令時，機器人會自動在該頻道建立一個名為 `TranslationBot` 的 Webhook，並將 URL 儲存在設定檔中。這個 Webhook 讓機器人能以原始用戶的名字和頭像發送翻譯後的訊息。
 
 ---
 
@@ -71,11 +73,12 @@ discord_trans_bot/
 ├── bot.py
 ├── translator.py
 ├── config.py
+├── glossary.py
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env              ← 你需要自己建立此檔案（見下方說明）
-└── data/             ← 建立此空資料夾（儲存頻道設定）
+└── data/             ← 建立此空資料夾（儲存頻道設定與詞彙表）
 ```
 
 ### 2. 建立 `.env` 檔案
@@ -90,7 +93,7 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 
 ### 3. 建立 `data` 資料夾
 
-在 `discord_trans_bot` 資料夾內建立一個名為 `data` 的空資料夾，用來持久化頻道設定。
+在 `discord_trans_bot` 資料夾內建立一個名為 `data` 的空資料夾，用來持久化頻道設定與詞彙表。
 
 ### 4. 使用 Container Manager 建立專案
 
@@ -111,6 +114,7 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
   ```
   Logged in as 翻譯機器人#1234 (ID: 123456789)
   Loaded channel configs for 0 guild(s)
+  Synced 6 slash command(s)
   ```
 
 ---
@@ -131,28 +135,93 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 
 ## 四、Discord 指令設定
 
-機器人啟動後，在你的 Discord 伺服器中執行以下指令進行初始設定（需要「管理頻道」權限）：
+機器人啟動後，在你的 Discord 伺服器中執行以下指令進行初始設定。  
+**Slash 指令**（`/`）為主要方式，舊版 `!` 前綴指令仍可使用。
+
+> **注意**：Slash 指令在機器人首次啟動後最多需要 **1 小時**才會在 Discord 全域生效。期間可先使用 `!` 前綴指令。
+
+### 初始設定範例
 
 ```
-!setlang zh-TW #中文
-!setlang en #english
-!setlang ja #日本語
-!setlang ko #한국어
+/setlang lang_code:zh-TW channel:#中文
+/setlang lang_code:en channel:#english
+/setlang lang_code:ja channel:#日本語
+/setlang lang_code:ko channel:#한국어
 ```
 
 執行後機器人會自動在各頻道建立 Webhook，之後所有訊息會自動翻譯並同步。
 
-### 所有指令
+### 頻道管理指令
 
 | 指令 | 所需權限 | 說明 |
 |------|---------|------|
-| `!setlang <語言代碼> [#頻道]` | 管理頻道 | 將頻道設為語言頻道（省略 #頻道 則為目前頻道） |
-| `!unsetlang [#頻道]` | 管理頻道 | 取消語言頻道設定並刪除對應 Webhook |
-| `!listlang` | 所有人 | 列出目前所有語言頻道 |
+| `/setlang <語言代碼> [#頻道]` | 管理頻道 | 將頻道設為語言頻道（省略 #頻道 則為目前頻道） |
+| `/unsetlang [#頻道]` | 管理頻道 | 取消語言頻道設定並刪除對應 Webhook |
+| `/listlang` | 所有人 | 列出目前所有語言頻道 |
+
+### 詞彙表指令
+
+詞彙表可以固定特定詞彙的翻譯，避免機器翻譯出現錯誤（例如伺服器名稱、遊戲術語）。
+
+| 指令 | 所需權限 | 說明 |
+|------|---------|------|
+| `/addterm word:<詞彙> lang:<語言代碼> translation:<翻譯>` | 管理頻道 | 新增詞彙表條目 |
+| `/removeterm word:<詞彙> [lang:<語言代碼>]` | 管理頻道 | 移除詞彙表條目（省略 lang 則刪除所有語言） |
+| `/listterms` | 所有人 | 列出目前所有詞彙表條目 |
+
+**範例**：
+
+```
+/addterm word:招新 lang:en translation:recruitment
+/addterm word:招新 lang:ja translation:新入生募集
+/addterm word:公會 lang:en translation:guild
+```
 
 ---
 
-## 五、語言代碼參考
+## 五、功能說明
+
+### 訊息同步
+
+| 功能 | 說明 |
+|------|------|
+| 翻譯轉發 | 以原始用戶名稱與頭像，透過 Webhook 發送翻譯後的訊息 |
+| 附件轉發 | 圖片、檔案同步轉發到所有語言頻道 |
+| 貼圖轉發 | PNG／GIF 貼圖以圖片附件形式轉發（Lottie 格式除外） |
+| 回覆引用 | 回覆訊息時，其他頻道會以 blockquote 顯示被回覆的翻譯內容 |
+| Embed 轉發 | 連結預覽（Link Preview）自動同步到所有語言頻道 |
+
+### 訊息操作同步
+
+| 功能 | 說明 |
+|------|------|
+| 編輯同步 | 編輯訊息時，其他頻道的翻譯也同步更新 |
+| 附件編輯同步 | 編輯時若附件有變動，刪除舊訊息並重新發送 |
+| 刪除同步 | 刪除訊息時，其他頻道的翻譯訊息一併刪除 |
+| 批量刪除同步 | 一次批量刪除多則訊息也會全部同步 |
+| Reaction 同步 | 新增、移除、清除 Reaction 均同步到所有對應訊息 |
+| 置頂同步 | 置頂或取消置頂訊息時，其他頻道同步操作（需要「管理訊息」權限） |
+
+### 翻譯引擎
+
+| 功能 | 說明 |
+|------|------|
+| 自動偵測語言 | 優先使用 `source=auto` 自動偵測，對混合語言訊息更準確 |
+| 翻譯快取 | 相同內容不重複呼叫 API，節省資源 |
+| 限流重試 | 遇到 Google Translate 限流（429）時自動退避重試 |
+| 備用翻譯引擎 | Google Translate 失敗時自動切換至 MyMemory |
+
+### 特殊行為
+
+| 功能 | 說明 |
+|------|------|
+| 不翻譯前綴 `//` | 訊息以 `//` 開頭時，不翻譯、不轉發，只在來源頻道顯示 |
+| 純 Emoji 訊息 | 只有 Emoji 的訊息（如 👀）直接原文轉發，不嘗試翻譯 |
+| Discord 自訂表情 | `<:name:id>` 格式的自訂表情從翻譯中抽出，接在翻譯結果後方 |
+
+---
+
+## 六、語言代碼參考
 
 | 代碼 | 語言 |
 |------|------|
@@ -166,5 +235,8 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 | `es` | Español |
 | `vi` | Tiếng Việt |
 | `th` | ภาษาไทย |
+| `id` | Bahasa Indonesia |
+| `ru` | Русский |
+| `ar` | العربية |
 
 完整語言代碼清單請參考：https://py-googletrans.readthedocs.io/en/latest/
