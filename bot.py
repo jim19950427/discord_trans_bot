@@ -73,6 +73,19 @@ async def on_ready():
     global channel_configs, _glossary_data
     channel_configs = load_channel_config()
     _glossary_data = load_glossary()
+
+    # Pre-populate pin cache so the first pin event doesn't treat all existing
+    # pins as newly added (which would cause spurious sync attempts).
+    for gc in channel_configs.values():
+        for ch_id in gc:
+            ch = bot.get_channel(ch_id)
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    pins = await ch.pins()
+                    _channel_pins[ch_id] = {m.id for m in pins}
+                except discord.HTTPException:
+                    _channel_pins[ch_id] = set()
+
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Loaded channel configs for {len(channel_configs)} guild(s)")
     try:
@@ -458,11 +471,14 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
         for ch_id, cluster_msg_id in cluster["channels"].items():
             if ch_id == channel.id:
                 continue
+            if cluster_msg_id in _channel_pins.get(ch_id, set()):
+                continue  # already pinned — skip to avoid cascade re-pinning
             ch = bot.get_channel(ch_id)
             if not ch:
                 continue
             try:
                 await (await ch.fetch_message(cluster_msg_id)).pin()
+                _channel_pins.setdefault(ch_id, set()).add(cluster_msg_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                 print(f"Failed to pin {cluster_msg_id} in channel {ch_id}: {e}")
 
@@ -473,11 +489,14 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
         for ch_id, cluster_msg_id in cluster["channels"].items():
             if ch_id == channel.id:
                 continue
+            if cluster_msg_id not in _channel_pins.get(ch_id, set()):
+                continue  # not pinned there — skip to avoid cascade
             ch = bot.get_channel(ch_id)
             if not ch:
                 continue
             try:
                 await (await ch.fetch_message(cluster_msg_id)).unpin()
+                _channel_pins.get(ch_id, set()).discard(cluster_msg_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                 print(f"Failed to unpin {cluster_msg_id} in channel {ch_id}: {e}")
 
