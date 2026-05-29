@@ -13,6 +13,8 @@ _SUPPORTED: dict[str, str] = {
 _CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
 # Matches any real word character (letters/digits from any script, incl. CJK)
 _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
+# HTML tags that MyMemory sometimes injects into results
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 # MyMemory uses locale codes; map common lang codes to them
 _MYMEMORY_MAP: dict[str, str] = {
@@ -61,6 +63,8 @@ def _try_mymemory(text: str, src: str, dest: str) -> str | None:
         return None
     try:
         result = MyMemoryTranslator(source=mm_src, target=mm_dest).translate(text)
+        if result:
+            result = _HTML_TAG_RE.sub("", result).strip()
         return result or None
     except Exception as e:
         print(f"MyMemory fallback error ({src} -> {dest}): {e}")
