@@ -1122,11 +1122,15 @@ async def translate_context_menu(interaction: discord.Interaction, message: disc
     ])
 
     src_label = source_lang if source_lang != "auto" else "自動偵測"
+    valid_results = [(lang, t) for lang, t in zip(target_langs, results) if t]
+    # Discord embed total limit is 6000 chars; divide evenly across all fields
+    num_fields = 1 + len(valid_results)
+    per_field = min(1024, max(100, 5500 // num_fields))
+
     embed = discord.Embed(title="翻譯結果", color=discord.Color.blue())
-    embed.add_field(name=f"原文（{src_label}）", value=text[:1024], inline=False)
-    for lang, translated in zip(target_langs, results):
-        if translated:
-            embed.add_field(name=lang, value=translated[:1024], inline=False)
+    embed.add_field(name=f"原文（{src_label}）", value=text[:per_field], inline=False)
+    for lang, translated in valid_results:
+        embed.add_field(name=lang, value=translated[:per_field], inline=False)
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
