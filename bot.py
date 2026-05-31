@@ -4,7 +4,7 @@ import asyncio
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from translator import translate_text, translate_text_nocache, normalize_lang
 from config import load_channel_config, save_channel_config
@@ -12,6 +12,9 @@ from glossary import (
     load_glossary, save_glossary, get_guild_glossary,
     load_substitutions, save_substitutions, get_guild_substitutions,
     load_user_langs, save_user_langs,
+    save_clusters, load_clusters,
+    save_thread_clusters, load_thread_clusters,
+    save_channel_pins, load_channel_pins,
 )
 
 load_dotenv()
@@ -94,6 +97,24 @@ def _guild_channels_for(channel_id: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Cluster persistence
+# ---------------------------------------------------------------------------
+
+@tasks.loop(seconds=60)
+async def _persist_clusters():
+    await asyncio.to_thread(save_clusters, dict(_msg_clusters))
+    await asyncio.to_thread(save_thread_clusters, dict(_thread_clusters))
+    await asyncio.to_thread(save_channel_pins, dict(_channel_pins))
+
+
+@bot.event
+async def on_close():
+    save_clusters(_msg_clusters)
+    save_thread_clusters(_thread_clusters)
+    save_channel_pins(_channel_pins)
+
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
@@ -116,8 +137,18 @@ async def on_ready():
                 except discord.HTTPException:
                     _channel_pins[ch_id] = set()
 
+    _msg_clusters.update(load_clusters())
+    _thread_clusters.update(load_thread_clusters())
+    saved_pins = load_channel_pins()
+    for ch_id, pin_set in saved_pins.items():
+        _channel_pins.setdefault(ch_id, set()).update(pin_set)
+
+    if not _persist_clusters.is_running():
+        _persist_clusters.start()
+
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
     print(f"Loaded channel configs for {len(channel_configs)} guild(s)")
+    print(f"Restored {len(_msg_clusters)} msg clusters, {len(_thread_clusters)} thread clusters")
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s)")
