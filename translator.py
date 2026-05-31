@@ -107,6 +107,7 @@ def translate_text(
     target_lang: str,
     glossary: dict | None = None,
     substitutions: dict | None = None,
+    _use_cache: bool = True,
 ) -> str | None:
     src = normalize_lang(source_lang)
     dest = normalize_lang(target_lang)
@@ -158,7 +159,7 @@ def translate_text(
                 else:
                     line_result = _restore_glossary(segment, placeholder_map)
         else:
-            line_result = _cached_translate(segment, src, dest)
+            line_result = (_cached_translate if _use_cache else _translate_with_fallback)(segment, src, dest)
 
         if not line_result:
             print(f"[translate] all attempts failed ({src}->{dest}): {repr(line_stripped)}")
@@ -175,3 +176,14 @@ def translate_text(
         result = result + "  " + " ".join(emojis)
 
     return result
+
+
+def translate_text_nocache(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    glossary: dict | None = None,
+    substitutions: dict | None = None,
+) -> str | None:
+    """Same as translate_text but bypasses the LRU cache — use for re-translation feedback."""
+    return translate_text(text, source_lang, target_lang, glossary, substitutions, _use_cache=False)

@@ -49,9 +49,22 @@ B 在 #english 輸入「Good morning」
 
 | Slash 指令 | 前綴指令（備用） | 所需權限 | 說明 |
 |-----------|----------------|---------|------|
-| `/addlang lang_code:<代碼> [channel:#頻道]` | `!addlang <代碼> [#頻道]` | 管理頻道 | 將頻道設為語言頻道（省略頻道則為目前頻道） |
+| `/addlang lang_code:<代碼> [channel:#頻道] [group:<群組>]` | `!addlang <代碼> [#頻道] [群組]` | 管理頻道 | 將頻道設為語言頻道（省略頻道則為目前頻道） |
 | `/removelang [channel:#頻道]` | `!removelang [#頻道]` | 管理頻道 | 取消語言頻道設定並刪除對應 Webhook |
-| `/listlang` | `!listlang` | 所有人 | 列出目前所有語言頻道 |
+| `/listlang` | `!listlang` | 所有人 | 列出目前所有語言頻道（依群組分組顯示） |
+
+### 語言頻道群組
+
+同一伺服器可設置多個獨立的翻譯群組，不同群組的頻道互不干擾：
+
+```
+/addlang lang_code:zh-TW channel:#遊戲中文 group:gaming
+/addlang lang_code:en channel:#gaming-en group:gaming
+/addlang lang_code:zh-TW channel:#閒聊中文 group:chat
+/addlang lang_code:en channel:#casual-en group:chat
+```
+
+省略 `group` 參數則加入 `default` 群組。
 
 ---
 
@@ -126,6 +139,7 @@ B 在 #english 輸入「Good morning」
 | 貼圖轉發 | PNG／GIF 貼圖以圖片附件形式轉發（Lottie 向量格式除外） |
 | 回覆引用 | 回覆訊息時，其他頻道以 blockquote 顯示被引用的翻譯內容與發送者姓名，例如：`> **夏希下井**: 它很害怕。` |
 | Embed 轉發 | 連結預覽（Link Preview）會在 Discord 產生後自動同步到所有語言頻道 |
+| 討論串同步 | 在語言頻道建立公開討論串時，Bot 自動在同群組的其他語言頻道建立對應討論串（名稱翻譯），串內訊息同步翻譯 |
 
 ### 訊息操作同步
 
@@ -146,6 +160,8 @@ B 在 #english 輸入「Good morning」
 | 原文轉發前綴 `\` | 訊息以 `\` 開頭時，不翻譯、但原文轉發到所有語言頻道。例如輸入 `\ GG`，所有頻道都會顯示 `GG` |
 | 純 Emoji 訊息 | 只有 Emoji 的訊息（如 👀）直接原文轉發，不嘗試翻譯（避免 Google 亂翻） |
 | Discord 自訂表情 | `<:name:id>` 格式的自訂表情從翻譯中抽出，接在翻譯結果後方 |
+| 🔄 翻譯回報 | 對翻譯結果不滿意時，在任一語言頻道的翻譯訊息上按 🔄 Reaction，Bot 會重新翻譯並更新該訊息（🔄 自動消失，可再次使用） |
+| 右鍵翻譯 | 右鍵任意訊息 → Apps → **翻譯此訊息**，以私訊 Embed 顯示各語言翻譯（不轉發） |
 
 ---
 
@@ -154,6 +170,8 @@ B 在 #english 輸入「Good morning」
 | 限制 | 說明 |
 |------|------|
 | 容器重啟後追蹤記憶體清空 | 編輯、刪除、Reaction、置頂同步只對**容器重啟後**發送的訊息有效；重啟前的舊訊息無法追蹤 |
+| 討論串同步只追蹤新建的串 | Bot 啟動後才建立的討論串才會被追蹤，重啟前已存在的討論串不追蹤 |
+| 討論串同步需要額外權限 | Bot 需要「建立公開討論串」或「管理討論串」權限才能在其他頻道建立對應串 |
 | 置頂同步需要頻道層級權限 | 若置頂無法同步，請確認 Bot 在每個語言頻道都有「管理訊息」權限（角色層級的全域權限有時會被頻道層級設定覆蓋） |
 | Reaction 以 Bot 帳號顯示 | Discord API 不允許 Bot 代替其他用戶新增 Reaction，因此同步的 Reaction 會顯示為機器人帳號所新增 |
 | Lottie 貼圖無法轉發 | Discord 向量動畫貼圖（Lottie 格式）為 JSON 檔案，無法轉成圖片，會直接跳過 |
