@@ -72,6 +72,9 @@ discord_trans_bot/
 
 ```
 DISCORD_TOKEN=你的Bot_Token貼在這裡
+
+# 可選設定（有預設值，不填也可以）
+# MAX_CLUSTER_ENTRIES=1500   ← 追蹤訊息上限（預設 1500，超過時自動淘汰最舊的）
 ```
 
 > 若 File Station 不允許建立以點開頭的檔案，可先命名為 `env.txt` 上傳後再改名，或透過 SSH 建立。

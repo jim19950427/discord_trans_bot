@@ -55,7 +55,7 @@ FEEDBACK_EMOJI = "🔄"
 #   att_names      {channel_id: [filename, ...]}  for detecting attachment changes
 #   embed_count    number of embeds seen so far (for link-preview forwarding)
 _msg_clusters: dict[int, dict] = {}
-_MAX_CLUSTER_ENTRIES = 1500
+_MAX_CLUSTER_ENTRIES = int(os.getenv("MAX_CLUSTER_ENTRIES", "1500"))
 
 # Cached pinned message ID sets per channel for change detection
 _channel_pins: dict[int, set[int]] = {}
