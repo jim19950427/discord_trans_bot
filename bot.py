@@ -806,9 +806,46 @@ async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> 
         print(f"Failed to delete webhook message {msg_id} in channel {ch_id}: {e}")
 
 
+async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_id: int) -> str | None:
+    """Re-translate a specific message and edit it in place. Returns new text or None."""
+    guild_channels = _guild_channels_for(parent_ch_id)
+    if parent_ch_id not in guild_channels:
+        return None
+    info = guild_channels[parent_ch_id]
+    source_ch = cluster["source_ch"]
+    source_text = cluster["contents"].get(source_ch, "")
+    source_lang = cluster["source_lang"]
+    target_lang = info["lang"]
+    if source_lang == target_lang or not source_text:
+        return None
+    webhook_url = info.get("webhook_url")
+    if not webhook_url:
+        return None
+
+    guild_glossary = get_guild_glossary(guild_id, _glossary_data)
+    guild_subs = get_guild_substitutions(guild_id, _substitutions_data)
+    translated = await asyncio.to_thread(
+        translate_text_nocache, source_text, source_lang, target_lang, guild_glossary, guild_subs
+    )
+    if not translated or translated.strip() == source_text.strip():
+        return None
+
+    prefix = cluster.get("prefixes", {}).get(parent_ch_id, "")
+    full_content = f"{prefix}\n{translated}" if prefix else translated
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            await webhook.edit_message(msg_id, content=full_content)
+        cluster["contents"][parent_ch_id] = translated
+        print(f"[retranslate] ({source_lang}->{target_lang}) updated msg={msg_id}")
+        return translated
+    except Exception as e:
+        print(f"[retranslate] edit failed msg={msg_id}: {e}")
+        return None
+
+
 async def _handle_feedback(payload: discord.RawReactionActionEvent, cluster: dict) -> None:
     """Re-translate the message for the channel where 🔄 was reacted."""
-    # channel_id in payload could be a thread; resolve to parent channel key
     react_ch_id = payload.channel_id
     thread_channels = cluster.get("thread_channels", {})
     parent_ch_id = react_ch_id
@@ -818,22 +855,6 @@ async def _handle_feedback(payload: discord.RawReactionActionEvent, cluster: dic
                 parent_ch_id = pid
                 break
 
-    guild_channels = _guild_channels_for(react_ch_id)
-    if parent_ch_id not in guild_channels:
-        return
-
-    info = guild_channels[parent_ch_id]
-    source_ch = cluster["source_ch"]
-    source_text = cluster["contents"].get(source_ch, "")
-    source_lang = cluster["source_lang"]
-    target_lang = info["lang"]
-    if source_lang == target_lang:
-        return
-    webhook_url = info.get("webhook_url")
-    msg_id = cluster["channels"].get(parent_ch_id)
-    if not source_text or not webhook_url or not msg_id:
-        return
-
     guild_id: int | None = None
     for guild in bot.guilds:
         if parent_ch_id in channel_configs.get(guild.id, {}):
@@ -842,25 +863,12 @@ async def _handle_feedback(payload: discord.RawReactionActionEvent, cluster: dic
     if guild_id is None:
         return
 
-    guild_glossary = get_guild_glossary(guild_id, _glossary_data)
-    guild_subs = get_guild_substitutions(guild_id, _substitutions_data)
-
-    translated = await asyncio.to_thread(
-        translate_text_nocache, source_text, source_lang, target_lang, guild_glossary, guild_subs
-    )
-    if not translated or translated.strip() == source_text.strip():
+    msg_id = cluster["channels"].get(parent_ch_id)
+    if not msg_id:
         return
 
-    prefix = cluster.get("prefixes", {}).get(parent_ch_id, "")
-    full_content = f"{prefix}\n{translated}" if prefix else translated
-    try:
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(webhook_url, session=session)
-            await webhook.edit_message(msg_id, content=full_content)
-        cluster["contents"][parent_ch_id] = translated
-        print(f"[feedback] re-translated ({source_lang}->{target_lang})")
-    except Exception as e:
-        print(f"[feedback] edit failed msg={msg_id}: {e}")
+    translated = await _do_retranslate(parent_ch_id, msg_id, cluster, guild_id)
+    if not translated:
         return
 
     # Remove the 🔄 reaction so user can trigger again if needed
@@ -1145,6 +1153,74 @@ async def slash_listmylang(interaction: discord.Interaction):
     await interaction.response.send_message(
         f"你的翻譯語言：{', '.join(f'`{l}`' for l in langs)}", ephemeral=True
     )
+
+
+@bot.tree.context_menu(name="查看原文")
+async def view_source_context_menu(interaction: discord.Interaction, message: discord.Message):
+    cluster = _msg_clusters.get(message.id)
+    if not cluster:
+        await interaction.response.send_message(
+            "找不到此訊息的原文記錄。（僅追蹤容器重啟後發送的訊息）",
+            ephemeral=True,
+        )
+        return
+
+    source_ch_id = cluster["source_ch"]
+    source_text = cluster["contents"].get(source_ch_id, "")
+    source_lang = cluster["source_lang"]
+    author = cluster.get("author", "")
+
+    source_ch = bot.get_channel(source_ch_id)
+    ch_mention = source_ch.mention if source_ch else f"(#{source_ch_id})"
+
+    embed = discord.Embed(title="原文", color=discord.Color.greyple())
+    embed.add_field(name=f"來源頻道（{source_lang}）", value=ch_mention, inline=True)
+    if author:
+        embed.add_field(name="發送者", value=author, inline=True)
+    embed.add_field(name="原文內容", value=(source_text[:1024] or "（無文字）"), inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.context_menu(name="重新翻譯")
+async def retranslate_context_menu(interaction: discord.Interaction, message: discord.Message):
+    await interaction.response.defer(ephemeral=True)
+
+    cluster = _msg_clusters.get(message.id)
+    if not cluster:
+        await interaction.followup.send(
+            "找不到此訊息的翻譯記錄。（僅追蹤容器重啟後發送的訊息）",
+            ephemeral=True,
+        )
+        return
+
+    # Find parent_ch_id for this message in the cluster
+    parent_ch_id: int | None = None
+    for pid, mid in cluster["channels"].items():
+        if mid == message.id:
+            parent_ch_id = pid
+            break
+    if parent_ch_id is None:
+        await interaction.followup.send("無法找到此訊息對應的頻道。", ephemeral=True)
+        return
+
+    if parent_ch_id == cluster["source_ch"]:
+        await interaction.followup.send("此訊息是原文，無法重新翻譯。", ephemeral=True)
+        return
+
+    guild_id: int | None = None
+    for guild in bot.guilds:
+        if parent_ch_id in channel_configs.get(guild.id, {}):
+            guild_id = guild.id
+            break
+    if guild_id is None:
+        await interaction.followup.send("找不到對應的伺服器設定。", ephemeral=True)
+        return
+
+    translated = await _do_retranslate(parent_ch_id, message.id, cluster, guild_id)
+    if translated:
+        await interaction.followup.send("已重新翻譯。", ephemeral=True)
+    else:
+        await interaction.followup.send("重新翻譯失敗，或翻譯結果與原文相同。", ephemeral=True)
 
 
 @bot.tree.context_menu(name="翻譯此訊息")
