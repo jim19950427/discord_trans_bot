@@ -579,6 +579,9 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
 async def on_thread_create(thread: discord.Thread):
     if not thread.guild:
         return
+    # Skip threads created by the bot itself to prevent cascade
+    if thread.owner_id == bot.user.id:
+        return
     all_gc = channel_configs.get(thread.guild.id, {})
     if thread.parent_id not in all_gc:
         return
