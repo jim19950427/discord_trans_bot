@@ -882,6 +882,18 @@ async def _handle_feedback(payload: discord.RawReactionActionEvent, cluster: dic
             pass
 
 
+async def _ui_msg(user_id: int, text_zh: str) -> str:
+    """Return text_zh translated to the user's first registered language (LRU-cached)."""
+    langs = _user_langs_data.get(str(user_id), [])
+    if not langs:
+        return text_zh
+    target = normalize_lang(langs[0])
+    if target.lower().startswith("zh"):
+        return text_zh
+    translated = await asyncio.to_thread(translate_text, text_zh, "zh-TW", target)
+    return translated or text_zh
+
+
 # ---------------------------------------------------------------------------
 # Prefix commands (legacy / backwards-compat)
 # ---------------------------------------------------------------------------
@@ -1157,10 +1169,11 @@ async def slash_listmylang(interaction: discord.Interaction):
 
 @bot.tree.context_menu(name="查看原文")
 async def view_source_context_menu(interaction: discord.Interaction, message: discord.Message):
+    uid = interaction.user.id
     cluster = _msg_clusters.get(message.id)
     if not cluster:
         await interaction.response.send_message(
-            "找不到此訊息的原文記錄。（僅追蹤容器重啟後發送的訊息）",
+            await _ui_msg(uid, "找不到此訊息的原文記錄。（僅追蹤容器重啟後發送的訊息）"),
             ephemeral=True,
         )
         return
@@ -1173,11 +1186,18 @@ async def view_source_context_menu(interaction: discord.Interaction, message: di
     source_ch = bot.get_channel(source_ch_id)
     ch_mention = source_ch.mention if source_ch else f"(#{source_ch_id})"
 
-    embed = discord.Embed(title="原文", color=discord.Color.greyple())
-    embed.add_field(name=f"來源頻道（{source_lang}）", value=ch_mention, inline=True)
+    title, f_channel, f_sender, f_content, no_text = await asyncio.gather(
+        _ui_msg(uid, "原文"),
+        _ui_msg(uid, f"來源頻道（{source_lang}）"),
+        _ui_msg(uid, "發送者"),
+        _ui_msg(uid, "原文內容"),
+        _ui_msg(uid, "（無文字）"),
+    )
+    embed = discord.Embed(title=title, color=discord.Color.greyple())
+    embed.add_field(name=f_channel, value=ch_mention, inline=True)
     if author:
-        embed.add_field(name="發送者", value=author, inline=True)
-    embed.add_field(name="原文內容", value=(source_text[:1024] or "（無文字）"), inline=False)
+        embed.add_field(name=f_sender, value=author, inline=True)
+    embed.add_field(name=f_content, value=(source_text[:1024] or no_text), inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -1185,10 +1205,11 @@ async def view_source_context_menu(interaction: discord.Interaction, message: di
 async def retranslate_context_menu(interaction: discord.Interaction, message: discord.Message):
     await interaction.response.defer(ephemeral=True)
 
+    uid = interaction.user.id
     cluster = _msg_clusters.get(message.id)
     if not cluster:
         await interaction.followup.send(
-            "找不到此訊息的翻譯記錄。（僅追蹤容器重啟後發送的訊息）",
+            await _ui_msg(uid, "找不到此訊息的翻譯記錄。（僅追蹤容器重啟後發送的訊息）"),
             ephemeral=True,
         )
         return
@@ -1200,11 +1221,15 @@ async def retranslate_context_menu(interaction: discord.Interaction, message: di
             parent_ch_id = pid
             break
     if parent_ch_id is None:
-        await interaction.followup.send("無法找到此訊息對應的頻道。", ephemeral=True)
+        await interaction.followup.send(
+            await _ui_msg(uid, "無法找到此訊息對應的頻道。"), ephemeral=True
+        )
         return
 
     if parent_ch_id == cluster["source_ch"]:
-        await interaction.followup.send("此訊息是原文，無法重新翻譯。", ephemeral=True)
+        await interaction.followup.send(
+            await _ui_msg(uid, "此訊息是原文，無法重新翻譯。"), ephemeral=True
+        )
         return
 
     guild_id: int | None = None
@@ -1213,23 +1238,30 @@ async def retranslate_context_menu(interaction: discord.Interaction, message: di
             guild_id = guild.id
             break
     if guild_id is None:
-        await interaction.followup.send("找不到對應的伺服器設定。", ephemeral=True)
+        await interaction.followup.send(
+            await _ui_msg(uid, "找不到對應的伺服器設定。"), ephemeral=True
+        )
         return
 
     translated = await _do_retranslate(parent_ch_id, message.id, cluster, guild_id)
     if translated:
-        await interaction.followup.send("已重新翻譯。", ephemeral=True)
+        await interaction.followup.send(await _ui_msg(uid, "已重新翻譯。"), ephemeral=True)
     else:
-        await interaction.followup.send("重新翻譯失敗，或翻譯結果與原文相同。", ephemeral=True)
+        await interaction.followup.send(
+            await _ui_msg(uid, "重新翻譯失敗，或翻譯結果與原文相同。"), ephemeral=True
+        )
 
 
 @bot.tree.context_menu(name="翻譯此訊息")
 async def translate_context_menu(interaction: discord.Interaction, message: discord.Message):
     await interaction.response.defer(ephemeral=True)
 
+    uid = interaction.user.id
     text = message.content
     if not text:
-        await interaction.followup.send("此訊息沒有文字內容。\nThis message has no text content.", ephemeral=True)
+        await interaction.followup.send(
+            await _ui_msg(uid, "此訊息沒有文字內容。"), ephemeral=True
+        )
         return
 
     # Check user's registered languages
