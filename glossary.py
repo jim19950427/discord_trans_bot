@@ -45,3 +45,23 @@ def save_substitutions(data: dict) -> None:
 
 def get_guild_substitutions(guild_id: int, sub_data: dict) -> dict:
     return sub_data.get(str(guild_id), {})
+
+
+USER_LANGS_FILE = os.getenv("USER_LANGS_FILE", "/data/user_langs.json")
+
+
+def load_user_langs() -> dict:
+    """Returns {str(user_id): [lang_code, ...]}"""
+    if not os.path.exists(USER_LANGS_FILE):
+        return {}
+    try:
+        with open(USER_LANGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_user_langs(data: dict) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(USER_LANGS_FILE)), exist_ok=True)
+    with open(USER_LANGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)

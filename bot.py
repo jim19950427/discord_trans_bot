@@ -11,6 +11,7 @@ from config import load_channel_config, save_channel_config
 from glossary import (
     load_glossary, save_glossary, get_guild_glossary,
     load_substitutions, save_substitutions, get_guild_substitutions,
+    load_user_langs, save_user_langs,
 )
 
 load_dotenv()
@@ -30,6 +31,9 @@ _glossary_data: dict = {}
 
 # {str(guild_id): {source_term: replacement}}
 _substitutions_data: dict = {}
+
+# {str(user_id): [lang_code, ...]}
+_user_langs_data: dict = {}
 
 WEBHOOK_NAME = "TranslationBot"
 NO_TRANSLATE_PREFIX = "//"
@@ -95,10 +99,11 @@ def _guild_channels_for(channel_id: int) -> dict:
 
 @bot.event
 async def on_ready():
-    global channel_configs, _glossary_data, _substitutions_data
+    global channel_configs, _glossary_data, _substitutions_data, _user_langs_data
     channel_configs = load_channel_config()
     _glossary_data = load_glossary()
     _substitutions_data = load_substitutions()
+    _user_langs_data = load_user_langs()
 
     # Pre-populate pin cache so the first pin event doesn't treat all existing
     # pins as newly added (which would cause spurious sync attempts).
@@ -1091,32 +1096,92 @@ async def slash_listsubs(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="addmylang", description="新增個人翻譯語言（右鍵翻譯時使用）")
+@app_commands.describe(lang="語言代碼（例如 zh-TW, en, ja）")
+async def slash_addmylang(interaction: discord.Interaction, lang: str):
+    user_id = str(interaction.user.id)
+    normalized = normalize_lang(lang)
+    langs = _user_langs_data.setdefault(user_id, [])
+    if normalized in langs:
+        await interaction.response.send_message(
+            f"`{normalized}` 已在你的翻譯語言清單中。", ephemeral=True
+        )
+        return
+    langs.append(normalized)
+    save_user_langs(_user_langs_data)
+    await interaction.response.send_message(
+        f"已新增 `{normalized}` 到你的翻譯語言。目前清單：{', '.join(f'`{l}`' for l in langs)}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="removemylang", description="移除個人翻譯語言")
+@app_commands.describe(lang="要移除的語言代碼")
+async def slash_removemylang(interaction: discord.Interaction, lang: str):
+    user_id = str(interaction.user.id)
+    normalized = normalize_lang(lang)
+    langs = _user_langs_data.get(user_id, [])
+    if normalized not in langs:
+        await interaction.response.send_message(
+            f"找不到 `{normalized}`，請先用 `/listmylang` 確認目前清單。", ephemeral=True
+        )
+        return
+    langs.remove(normalized)
+    if not langs:
+        del _user_langs_data[user_id]
+    save_user_langs(_user_langs_data)
+    remaining = f"目前清單：{', '.join(f'`{l}`' for l in langs)}" if langs else "目前清單為空。"
+    await interaction.response.send_message(f"已移除 `{normalized}`。{remaining}", ephemeral=True)
+
+
+@bot.tree.command(name="listmylang", description="列出你目前設定的個人翻譯語言")
+async def slash_listmylang(interaction: discord.Interaction):
+    langs = _user_langs_data.get(str(interaction.user.id), [])
+    if not langs:
+        await interaction.response.send_message(
+            "你尚未設定任何翻譯語言。使用 `/addmylang` 新增。", ephemeral=True
+        )
+        return
+    await interaction.response.send_message(
+        f"你的翻譯語言：{', '.join(f'`{l}`' for l in langs)}", ephemeral=True
+    )
+
+
 @bot.tree.context_menu(name="翻譯此訊息")
 async def translate_context_menu(interaction: discord.Interaction, message: discord.Message):
     await interaction.response.defer(ephemeral=True)
 
-    all_gc = channel_configs.get(interaction.guild_id, {})
+    text = message.content
+    if not text:
+        await interaction.followup.send("此訊息沒有文字內容。\nThis message has no text content.", ephemeral=True)
+        return
 
-    # Resolve source channel (use parent if in a thread)
+    # Check user's registered languages
+    user_langs = _user_langs_data.get(str(interaction.user.id), [])
+    if not user_langs:
+        await interaction.followup.send(
+            "## 尚未設定翻譯語言\n"
+            "請使用以下指令新增你想翻譯成的語言（可新增多個）：\n"
+            "> `/addmylang lang:zh-TW` — 繁體中文\n"
+            "> `/addmylang lang:en` — 英文\n"
+            "> `/addmylang lang:ja` — 日文\n\n"
+            "## Translation languages not set up\n"
+            "Use the command below to add languages (you can add multiple):\n"
+            "> `/addmylang lang:zh-TW` — Traditional Chinese\n"
+            "> `/addmylang lang:en` — English\n"
+            "> `/addmylang lang:ja` — Japanese",
+            ephemeral=True,
+        )
+        return
+
+    # Determine source language from channel config
+    all_gc = channel_configs.get(interaction.guild_id, {})
     ch_id = message.channel.id
     if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
         ch_id = message.channel.parent_id
+    source_lang = all_gc[ch_id]["lang"] if ch_id in all_gc else "auto"
 
-    if ch_id in all_gc:
-        source_lang = all_gc[ch_id]["lang"]
-        gc = _group_channels(all_gc, ch_id)
-        target_langs = [info["lang"] for cid, info in gc.items() if cid != ch_id]
-    else:
-        source_lang = "auto"
-        target_langs = list({info["lang"] for info in all_gc.values()})
-
-    text = message.content
-    if not text:
-        await interaction.followup.send("此訊息沒有文字內容。", ephemeral=True)
-        return
-    if not target_langs:
-        await interaction.followup.send("此伺服器尚未設定任何語言頻道。", ephemeral=True)
-        return
+    target_langs = [normalize_lang(l) for l in user_langs]
 
     guild_glossary = get_guild_glossary(interaction.guild_id, _glossary_data)
     results = await asyncio.gather(*[
