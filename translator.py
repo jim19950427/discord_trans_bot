@@ -19,6 +19,8 @@ _UNICODE_EMOJI_RE = re.compile(
     "]+",
     re.UNICODE,
 )
+# URLs — Google Translate returns them unchanged, causing pointless retries
+_URL_RE = re.compile(r"https?://\S+")
 # Matches any real word character (letters/digits from any script, incl. CJK)
 _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
 
@@ -149,9 +151,10 @@ def translate_text(
             translated_lines.append(line)
             continue
 
-        # Strip Unicode emojis so they don't confuse the translation API
+        # Strip Unicode emojis and URLs — both confuse/stall the translation API
         line_emojis = _UNICODE_EMOJI_RE.findall(line_stripped)
-        segment = _UNICODE_EMOJI_RE.sub("", line_stripped).strip()
+        line_urls = _URL_RE.findall(line_stripped)
+        segment = _URL_RE.sub("", _UNICODE_EMOJI_RE.sub("", line_stripped)).strip()
         if not segment or not _HAS_WORD_RE.search(segment):
             translated_lines.append(line_stripped)
             continue
@@ -180,6 +183,8 @@ def translate_text(
             translated_lines.append(line_stripped)
             continue
 
+        if line_urls:
+            line_result = line_result + "  " + " ".join(line_urls)
         if line_emojis:
             line_result = line_result + "  " + " ".join(line_emojis)
 
