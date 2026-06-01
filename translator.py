@@ -11,6 +11,14 @@ _SUPPORTED: dict[str, str] = {
 
 # Discord custom emoji: <:name:id> or animated <a:name:id>
 _CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+# Unicode emoji ranges (covers the vast majority of emoji in common use)
+_UNICODE_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF"  # Mahjong–Symbols and Pictographs Extended-A
+    "\U00002600-\U000027BF"   # Misc symbols, dingbats
+    "\U0000FE00-\U0000FEFF"   # Variation selectors
+    "]+",
+    re.UNICODE,
+)
 # Matches any real word character (letters/digits from any script, incl. CJK)
 _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
 
@@ -141,8 +149,14 @@ def translate_text(
             translated_lines.append(line)
             continue
 
+        # Strip Unicode emojis so they don't confuse the translation API
+        line_emojis = _UNICODE_EMOJI_RE.findall(line_stripped)
+        segment = _UNICODE_EMOJI_RE.sub("", line_stripped).strip()
+        if not segment or not _HAS_WORD_RE.search(segment):
+            translated_lines.append(line_stripped)
+            continue
+
         placeholder_map: dict[str, str] = {}
-        segment = line_stripped
         if glossary:
             segment, placeholder_map = _apply_glossary(segment, dest, glossary)
 
@@ -162,9 +176,12 @@ def translate_text(
             line_result = (_cached_translate if _use_cache else _translate_with_fallback)(segment, src, dest)
 
         if not line_result:
-            print(f"[translate] all attempts failed ({src}->{dest}): {repr(line_stripped)}")
+            print(f"[translate] all attempts failed ({src}->{dest}): {repr(segment)}")
             translated_lines.append(line_stripped)
             continue
+
+        if line_emojis:
+            line_result = line_result + "  " + " ".join(line_emojis)
 
         translated_lines.append(line_result)
 
