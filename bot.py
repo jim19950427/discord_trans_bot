@@ -258,22 +258,18 @@ async def on_message(message: discord.Message):
                 continue  # no corresponding thread in this channel
         target_lang = info["lang"]
         quoted = _quoted_text(ref_cluster, channel_id) if ref_cluster else None
-        if ref_cluster:
-            author = ref_cluster.get("author", "")
-            link = _ref_msg_link(ref_cluster, channel_id, message.guild.id)
-            quoted_author = f"[{author}]({link})" if (author and link) else author
-        else:
-            quoted_author = None
+        quoted_author = ref_cluster.get("author") if ref_cluster else None
+        msg_link = _ref_msg_link(ref_cluster, channel_id, message.guild.id) if ref_cluster else None
         tasks.append(
             _raw_forward_send(
                 content, webhook_url, username, avatar_url, attachments, stickers,
-                quoted, quoted_author, target_thread_id,
+                quoted, quoted_author, target_thread_id, msg_link,
             ) if raw_forward else
             _translate_and_send(
                 content, source_lang, target_lang,
                 webhook_url, username, avatar_url,
                 attachments, stickers, quoted, quoted_author,
-                guild_glossary, guild_substitutions, target_thread_id,
+                guild_glossary, guild_substitutions, target_thread_id, msg_link,
             )
         )
         target_channel_ids.append(channel_id)
@@ -313,11 +309,11 @@ async def on_message(message: discord.Message):
             quoted = _quoted_text(ref_cluster, ch_id)
             if quoted:
                 link = _ref_msg_link(ref_cluster, ch_id, message.guild.id)
-                author_display = f"[{ref_author}]({link})" if (ref_author and link) else ref_author
                 lines = quoted.splitlines()
                 pl: list[str] = []
-                if author_display and lines:
-                    pl.append(f"> **{author_display}**: {lines[0]}")
+                if ref_author and lines:
+                    first = f"**{ref_author}**: {lines[0]}"
+                    pl.append(f"> [{first}]({link})" if link else f"> {first}")
                     pl.extend(f"> {l}" for l in lines[1:])
                 else:
                     pl.extend(f"> {l}" for l in lines)
@@ -728,6 +724,7 @@ async def _raw_forward_send(
     quoted_content: str | None,
     quoted_author: str | None = None,
     thread_id: int | None = None,
+    msg_link: str | None = None,
 ) -> tuple[int, str] | None:
     files: list[discord.File] = []
     urls: list[tuple[str, str]] = (
@@ -751,7 +748,8 @@ async def _raw_forward_send(
     if quoted_content:
         lines = quoted_content.splitlines()
         if quoted_author and lines:
-            parts.append(f"> **{quoted_author}**: {lines[0]}")
+            first = f"**{quoted_author}**: {lines[0]}"
+            parts.append(f"> [{first}]({msg_link})" if msg_link else f"> {first}")
             parts.extend(f"> {line}" for line in lines[1:])
         else:
             parts.extend(f"> {line}" for line in lines)
@@ -787,6 +785,7 @@ async def _translate_and_send(
     glossary: dict | None = None,
     substitutions: dict | None = None,
     thread_id: int | None = None,
+    msg_link: str | None = None,
 ) -> tuple[int, str] | None:
     translated: str | None = None
     if text:
@@ -814,7 +813,8 @@ async def _translate_and_send(
     if quoted_content:
         lines = quoted_content.splitlines()
         if quoted_author and lines:
-            parts.append(f"> **{quoted_author}**: {lines[0]}")
+            first = f"**{quoted_author}**: {lines[0]}"
+            parts.append(f"> [{first}]({msg_link})" if msg_link else f"> {first}")
             parts.extend(f"> {line}" for line in lines[1:])
         else:
             parts.extend(f"> {line}" for line in lines)
