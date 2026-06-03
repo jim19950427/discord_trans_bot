@@ -11,6 +11,16 @@ _SUPPORTED: dict[str, str] = {
 
 # Discord custom emoji: <:name:id> or animated <a:name:id>
 _CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+# Unicode emoji ranges (covers the vast majority of emoji in common use)
+_UNICODE_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF"  # Mahjong–Symbols and Pictographs Extended-A
+    "\U00002600-\U000027BF"   # Misc symbols, dingbats
+    "\U0000FE00-\U0000FEFF"   # Variation selectors
+    "]+",
+    re.UNICODE,
+)
+# URLs — Google Translate returns them unchanged, causing pointless retries
+_URL_RE = re.compile(r"https?://\S+")
 # Matches any real word character (letters/digits from any script, incl. CJK)
 _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
 
@@ -107,6 +117,7 @@ def translate_text(
     target_lang: str,
     glossary: dict | None = None,
     substitutions: dict | None = None,
+    _use_cache: bool = True,
 ) -> str | None:
     src = normalize_lang(source_lang)
     dest = normalize_lang(target_lang)
@@ -116,7 +127,7 @@ def translate_text(
     # Apply pre-translation substitutions (e.g. aliases / euphemisms)
     if substitutions:
         for src_term, replacement in substitutions.items():
-            text = text.replace(src_term, replacement)
+            text = re.sub(re.escape(src_term), replacement, text, flags=re.IGNORECASE)
 
     # Pull out custom Discord emojis — Google Translate chokes on <:name:id> syntax
     emojis = _CUSTOM_EMOJI_RE.findall(text)
@@ -140,8 +151,15 @@ def translate_text(
             translated_lines.append(line)
             continue
 
+        # Strip Unicode emojis and URLs — both confuse/stall the translation API
+        line_emojis = _UNICODE_EMOJI_RE.findall(line_stripped)
+        line_urls = _URL_RE.findall(line_stripped)
+        segment = _URL_RE.sub("", _UNICODE_EMOJI_RE.sub("", line_stripped)).strip()
+        if not segment or not _HAS_WORD_RE.search(segment):
+            translated_lines.append(line_stripped)
+            continue
+
         placeholder_map: dict[str, str] = {}
-        segment = line_stripped
         if glossary:
             segment, placeholder_map = _apply_glossary(segment, dest, glossary)
 
@@ -158,12 +176,17 @@ def translate_text(
                 else:
                     line_result = _restore_glossary(segment, placeholder_map)
         else:
-            line_result = _cached_translate(segment, src, dest)
+            line_result = (_cached_translate if _use_cache else _translate_with_fallback)(segment, src, dest)
 
         if not line_result:
-            print(f"[translate] all attempts failed ({src}->{dest}): {repr(line_stripped)}")
+            print(f"[translate] all attempts failed ({src}->{dest}): {repr(segment)}")
             translated_lines.append(line_stripped)
             continue
+
+        if line_urls:
+            line_result = line_result + "  " + " ".join(line_urls)
+        if line_emojis:
+            line_result = line_result + "  " + " ".join(line_emojis)
 
         translated_lines.append(line_result)
 
@@ -175,3 +198,14 @@ def translate_text(
         result = result + "  " + " ".join(emojis)
 
     return result
+
+
+def translate_text_nocache(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    glossary: dict | None = None,
+    substitutions: dict | None = None,
+) -> str | None:
+    """Same as translate_text but bypasses the LRU cache — use for re-translation feedback."""
+    return translate_text(text, source_lang, target_lang, glossary, substitutions, _use_cache=False)
