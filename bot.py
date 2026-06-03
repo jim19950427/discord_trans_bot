@@ -81,14 +81,21 @@ def _group_channels(guild_channels: dict, channel_id: int) -> dict:
 
 
 def _quoted_text(ref_cluster: dict, channel_id: int) -> str:
-    """Return the best available quoted text for a reply, falling back to attachment filenames."""
+    """Return the best available quoted text for a reply, falling back to attachment links."""
     text = ref_cluster["contents"].get(channel_id, "")
     if text:
         return text
     names = ref_cluster.get("att_names", {}).get(channel_id, [])
-    if names:
-        return "📎 " + ", ".join(names)
-    return ""
+    if not names:
+        return ""
+    source_ch = ref_cluster["source_ch"]
+    urls = (ref_cluster.get("att_urls", {}).get(channel_id)
+            or ref_cluster.get("att_urls", {}).get(source_ch, []))
+    parts = []
+    for i, name in enumerate(names):
+        url = urls[i] if i < len(urls) else None
+        parts.append(f"[{name}]({url})" if url else name)
+    return "📎 " + ", ".join(parts)
 
 
 def _guild_channels_for(channel_id: int) -> dict:
@@ -272,6 +279,7 @@ async def on_message(message: discord.Message):
         "source_lang": source_lang,
         "prefixes": {},
         "att_names": {source_ch_id: [a.filename for a in attachments]},
+        "att_urls":  {source_ch_id: [a.url for a in attachments]},
         "embed_count": len(message.embeds),
     }
     for ch_id, tid, result in zip(target_channel_ids, target_thread_ids, results):
@@ -280,6 +288,7 @@ async def on_message(message: discord.Message):
             cluster["channels"][ch_id] = sent_id
             cluster["contents"][ch_id] = sent_text or ""
             cluster["att_names"][ch_id] = [a.filename for a in attachments]
+            cluster["att_urls"][ch_id] = [a.url for a in attachments]
             if tid is not None:
                 cluster["thread_channels"][ch_id] = tid
 

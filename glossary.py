@@ -87,7 +87,7 @@ def save_clusters(clusters: dict) -> None:
             "source_ch":   cluster["source_ch"],
             "source_lang": cluster["source_lang"],
         }
-        for opt_key in ("thread_channels", "prefixes", "att_names"):
+        for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
             if opt_key in cluster:
                 entry[opt_key] = {str(k): v for k, v in cluster[opt_key].items()}
         if "embed_count" in cluster:
@@ -114,7 +114,7 @@ def load_clusters() -> dict:
                 "source_ch":   int(entry["source_ch"]),
                 "source_lang": entry["source_lang"],
             }
-            for opt_key in ("thread_channels", "prefixes", "att_names"):
+            for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
                 if opt_key in entry:
                     cluster[opt_key] = _int_key_dict(entry[opt_key])
             if "embed_count" in entry:
