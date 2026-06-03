@@ -80,6 +80,17 @@ def _group_channels(guild_channels: dict, channel_id: int) -> dict:
             if info.get("group", "default") == my_group}
 
 
+def _quoted_text(ref_cluster: dict, channel_id: int) -> str:
+    """Return the best available quoted text for a reply, falling back to attachment filenames."""
+    text = ref_cluster["contents"].get(channel_id, "")
+    if text:
+        return text
+    names = ref_cluster.get("att_names", {}).get(channel_id, [])
+    if names:
+        return "📎 " + ", ".join(names)
+    return ""
+
+
 def _guild_channels_for(channel_id: int) -> dict:
     """Return group-filtered channels for channel_id (supports thread channel IDs)."""
     for guild in bot.guilds:
@@ -229,7 +240,7 @@ async def on_message(message: discord.Message):
             if target_thread_id is None:
                 continue  # no corresponding thread in this channel
         target_lang = info["lang"]
-        quoted = ref_cluster["contents"].get(channel_id) if ref_cluster else None
+        quoted = _quoted_text(ref_cluster, channel_id) if ref_cluster else None
         quoted_author = ref_cluster.get("author") if ref_cluster else None
         tasks.append(
             _raw_forward_send(
@@ -275,7 +286,7 @@ async def on_message(message: discord.Message):
     if ref_cluster:
         ref_author = ref_cluster.get("author", "")
         for ch_id in target_channel_ids:
-            quoted = ref_cluster["contents"].get(ch_id, "")
+            quoted = _quoted_text(ref_cluster, ch_id)
             if quoted:
                 lines = quoted.splitlines()
                 pl: list[str] = []
