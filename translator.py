@@ -127,7 +127,7 @@ def translate_text(
     # Apply pre-translation substitutions (e.g. aliases / euphemisms)
     if substitutions:
         for src_term, replacement in substitutions.items():
-            text = text.replace(src_term, replacement)
+            text = re.sub(re.escape(src_term), replacement, text, flags=re.IGNORECASE)
 
     # Pull out custom Discord emojis — Google Translate chokes on <:name:id> syntax
     emojis = _CUSTOM_EMOJI_RE.findall(text)
