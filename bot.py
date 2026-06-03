@@ -80,6 +80,16 @@ def _group_channels(guild_channels: dict, channel_id: int) -> dict:
             if info.get("group", "default") == my_group}
 
 
+def _ref_msg_link(ref_cluster: dict, channel_id: int, guild_id: int) -> str | None:
+    """Return a Discord jump URL for the given channel's copy of a ref_cluster message."""
+    msg_id = ref_cluster["channels"].get(channel_id)
+    if not msg_id:
+        return None
+    thread_id = ref_cluster.get("thread_channels", {}).get(channel_id)
+    link_ch = thread_id or channel_id
+    return f"https://discord.com/channels/{guild_id}/{link_ch}/{msg_id}"
+
+
 def _quoted_text(ref_cluster: dict, channel_id: int) -> str:
     """Return the best available quoted text for a reply, falling back to attachment links."""
     text = ref_cluster["contents"].get(channel_id, "")
@@ -248,7 +258,12 @@ async def on_message(message: discord.Message):
                 continue  # no corresponding thread in this channel
         target_lang = info["lang"]
         quoted = _quoted_text(ref_cluster, channel_id) if ref_cluster else None
-        quoted_author = ref_cluster.get("author") if ref_cluster else None
+        if ref_cluster:
+            author = ref_cluster.get("author", "")
+            link = _ref_msg_link(ref_cluster, channel_id, message.guild.id)
+            quoted_author = f"[{author}]({link})" if (author and link) else author
+        else:
+            quoted_author = None
         tasks.append(
             _raw_forward_send(
                 content, webhook_url, username, avatar_url, attachments, stickers,
@@ -297,10 +312,12 @@ async def on_message(message: discord.Message):
         for ch_id in target_channel_ids:
             quoted = _quoted_text(ref_cluster, ch_id)
             if quoted:
+                link = _ref_msg_link(ref_cluster, ch_id, message.guild.id)
+                author_display = f"[{ref_author}]({link})" if (ref_author and link) else ref_author
                 lines = quoted.splitlines()
                 pl: list[str] = []
-                if ref_author and lines:
-                    pl.append(f"> **{ref_author}**: {lines[0]}")
+                if author_display and lines:
+                    pl.append(f"> **{author_display}**: {lines[0]}")
                     pl.extend(f"> {l}" for l in lines[1:])
                 else:
                     pl.extend(f"> {l}" for l in lines)
