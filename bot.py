@@ -313,7 +313,7 @@ async def on_message(message: discord.Message):
                 pl: list[str] = []
                 if ref_author and lines:
                     first = f"**{ref_author}**: {lines[0]}"
-                    pl.append(f"> [{first}]({link})" if link else f"> {first}")
+                    pl.append(f"> {first} [↗]({link})" if link else f"> {first}")
                     pl.extend(f"> {l}" for l in lines[1:])
                 else:
                     pl.extend(f"> {l}" for l in lines)
@@ -749,7 +749,7 @@ async def _raw_forward_send(
         lines = quoted_content.splitlines()
         if quoted_author and lines:
             first = f"**{quoted_author}**: {lines[0]}"
-            parts.append(f"> [{first}]({msg_link})" if msg_link else f"> {first}")
+            parts.append(f"> {first} [↗]({msg_link})" if msg_link else f"> {first}")
             parts.extend(f"> {line}" for line in lines[1:])
         else:
             parts.extend(f"> {line}" for line in lines)
@@ -814,7 +814,7 @@ async def _translate_and_send(
         lines = quoted_content.splitlines()
         if quoted_author and lines:
             first = f"**{quoted_author}**: {lines[0]}"
-            parts.append(f"> [{first}]({msg_link})" if msg_link else f"> {first}")
+            parts.append(f"> {first} [↗]({msg_link})" if msg_link else f"> {first}")
             parts.extend(f"> {line}" for line in lines[1:])
         else:
             parts.extend(f"> {line}" for line in lines)
