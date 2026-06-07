@@ -117,6 +117,4 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 4. 完成，新程式立即生效
 
 > **什麼時候才需要重新建置 Image？**  
-> 當 `requirements.txt` 或 `Dockerfile` 內容有變更時，才需要在 Container Manager 專案中選擇 **重新建置（Build）**。一般程式邏輯的更新不需要此步驟。
->
-> ⚠️ **圖片翻譯功能（OCR + 字型覆蓋）需要重新建置**：此功能的 `Dockerfile` 新增了 Tesseract OCR、語言包與 Noto 字型等系統套件，僅替換 `.py` 檔案並 Stop/Start 不會生效，必須執行 **重新建置（Build）**。由於新增了較大的字型套件，image 體積會明顯增加，建置時間也會拉長。
+> 只有當 `requirements.txt` 內的套件版本有變更時，才需要在 Container Manager 專案中選擇 **重新建置（Build）**。一般程式邏輯的更新不需要此步驟。
