@@ -74,7 +74,9 @@ discord_trans_bot/
 DISCORD_TOKEN=你的Bot_Token貼在這裡
 
 # 可選設定（有預設值，不填也可以）
-# MAX_CLUSTER_ENTRIES=1500   ← 追蹤訊息上限（預設 1500，超過時自動淘汰最舊的）
+# MAX_CLUSTER_ENTRIES=1500            ← 追蹤訊息上限（預設 1500，超過時自動淘汰最舊的）
+# TRANSLATE_CACHE_DIR=/data/translate_cache   ← 翻譯快取目錄（預設值如左，已包含在 data volume 內，重啟不會消失）
+# TRANSLATE_CACHE_SIZE_LIMIT=52428800         ← 翻譯快取容量上限，單位 bytes（預設 50MB，超過時自動淘汰最少使用的項目）
 ```
 
 > 若 File Station 不允許建立以點開頭的檔案，可先命名為 `env.txt` 上傳後再改名，或透過 SSH 建立。

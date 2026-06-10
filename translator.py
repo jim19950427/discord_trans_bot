@@ -1,7 +1,25 @@
+import os
 import re
 import time
-from functools import lru_cache
+import diskcache
 from deep_translator import GoogleTranslator
+
+CACHE_DIR = os.getenv("TRANSLATE_CACHE_DIR", "/data/translate_cache")
+CACHE_SIZE_LIMIT = int(os.getenv("TRANSLATE_CACHE_SIZE_LIMIT", str(50 * 1024 * 1024)))
+
+_translate_cache: diskcache.Cache | None = None
+
+
+def _get_translate_cache() -> diskcache.Cache:
+    """Lazily create the on-disk translation cache (avoids touching disk at import time)."""
+    global _translate_cache
+    if _translate_cache is None:
+        _translate_cache = diskcache.Cache(
+            CACHE_DIR,
+            size_limit=CACHE_SIZE_LIMIT,
+            eviction_policy="least-recently-used",
+        )
+    return _translate_cache
 
 # Build a lowercase-keyed lookup so user input like "zh-tw" maps to "zh-TW"
 _SUPPORTED: dict[str, str] = {
@@ -76,12 +94,34 @@ def _translate_with_fallback(text: str, src: str, dest: str) -> str | None:
     return None
 
 
-@lru_cache(maxsize=2000)
-def _cached_translate(text: str, src: str, dest: str) -> str | None:
+def _cached_translate(text: str, src: str, dest: str, cache: diskcache.Cache | None = None) -> str | None:
+    if cache is None:
+        cache = _get_translate_cache()
+
+    key = (text, src, dest)
+    if key in cache:
+        return cache[key]
+
     print(f"[translate] ({src}->{dest}) input: {repr(text)}")
     result = _translate_with_fallback(text, src, dest)
     print(f"[translate] ({src}->{dest}) output: {repr(result)}")
+
+    if result is not None:
+        cache[key] = result
     return result
+
+
+def _term_pattern(term: str) -> re.Pattern:
+    """Case-insensitive pattern for a glossary term.
+
+    ASCII terms get word-boundary lookaround so "JIM" doesn't match inside
+    "JIMMY". Terms containing non-ASCII characters (CJK or mixed) are matched
+    as plain substrings, since CJK text has no whitespace word boundaries.
+    """
+    escaped = re.escape(term)
+    if term.isascii():
+        escaped = r"(?<![A-Za-z0-9])" + escaped + r"(?![A-Za-z0-9])"
+    return re.compile(escaped, re.IGNORECASE)
 
 
 def _apply_glossary(text: str, dest: str, glossary: dict) -> tuple[str, dict[str, str]]:
@@ -91,7 +131,8 @@ def _apply_glossary(text: str, dest: str, glossary: dict) -> tuple[str, dict[str
     """
     placeholder_map: dict[str, str] = {}
     for idx, (term, translations) in enumerate(glossary.items()):
-        if not re.search(re.escape(term), text, flags=re.IGNORECASE):
+        pattern = _term_pattern(term)
+        if not pattern.search(text):
             continue
         if dest in translations:
             replacement = translations[dest]
@@ -100,7 +141,7 @@ def _apply_glossary(text: str, dest: str, glossary: dict) -> tuple[str, dict[str
         else:
             continue
         ph = f"§{idx}§"
-        text = re.sub(re.escape(term), ph, text, flags=re.IGNORECASE)
+        text = pattern.sub(ph, text)
         placeholder_map[ph] = replacement
     return text, placeholder_map
 
