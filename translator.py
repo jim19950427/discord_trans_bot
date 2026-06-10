@@ -1,7 +1,25 @@
+import os
 import re
 import time
-from functools import lru_cache
+import diskcache
 from deep_translator import GoogleTranslator
+
+CACHE_DIR = os.getenv("TRANSLATE_CACHE_DIR", "/data/translate_cache")
+CACHE_SIZE_LIMIT = int(os.getenv("TRANSLATE_CACHE_SIZE_LIMIT", str(50 * 1024 * 1024)))
+
+_translate_cache: diskcache.Cache | None = None
+
+
+def _get_translate_cache() -> diskcache.Cache:
+    """Lazily create the on-disk translation cache (avoids touching disk at import time)."""
+    global _translate_cache
+    if _translate_cache is None:
+        _translate_cache = diskcache.Cache(
+            CACHE_DIR,
+            size_limit=CACHE_SIZE_LIMIT,
+            eviction_policy="least-recently-used",
+        )
+    return _translate_cache
 
 # Build a lowercase-keyed lookup so user input like "zh-tw" maps to "zh-TW"
 _SUPPORTED: dict[str, str] = {
@@ -76,11 +94,20 @@ def _translate_with_fallback(text: str, src: str, dest: str) -> str | None:
     return None
 
 
-@lru_cache(maxsize=2000)
-def _cached_translate(text: str, src: str, dest: str) -> str | None:
+def _cached_translate(text: str, src: str, dest: str, cache: diskcache.Cache | None = None) -> str | None:
+    if cache is None:
+        cache = _get_translate_cache()
+
+    key = (text, src, dest)
+    if key in cache:
+        return cache[key]
+
     print(f"[translate] ({src}->{dest}) input: {repr(text)}")
     result = _translate_with_fallback(text, src, dest)
     print(f"[translate] ({src}->{dest}) output: {repr(result)}")
+
+    if result is not None:
+        cache[key] = result
     return result
 
 
