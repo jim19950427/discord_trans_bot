@@ -84,6 +84,19 @@ def _cached_translate(text: str, src: str, dest: str) -> str | None:
     return result
 
 
+def _term_pattern(term: str) -> re.Pattern:
+    """Case-insensitive pattern for a glossary term.
+
+    ASCII terms get word-boundary lookaround so "JIM" doesn't match inside
+    "JIMMY". Terms containing non-ASCII characters (CJK or mixed) are matched
+    as plain substrings, since CJK text has no whitespace word boundaries.
+    """
+    escaped = re.escape(term)
+    if term.isascii():
+        escaped = r"(?<![A-Za-z0-9])" + escaped + r"(?![A-Za-z0-9])"
+    return re.compile(escaped, re.IGNORECASE)
+
+
 def _apply_glossary(text: str, dest: str, glossary: dict) -> tuple[str, dict[str, str]]:
     """Replace source terms with §N§ placeholders so they survive translation.
 
@@ -91,7 +104,8 @@ def _apply_glossary(text: str, dest: str, glossary: dict) -> tuple[str, dict[str
     """
     placeholder_map: dict[str, str] = {}
     for idx, (term, translations) in enumerate(glossary.items()):
-        if not re.search(re.escape(term), text, flags=re.IGNORECASE):
+        pattern = _term_pattern(term)
+        if not pattern.search(text):
             continue
         if dest in translations:
             replacement = translations[dest]
@@ -100,7 +114,7 @@ def _apply_glossary(text: str, dest: str, glossary: dict) -> tuple[str, dict[str
         else:
             continue
         ph = f"§{idx}§"
-        text = re.sub(re.escape(term), ph, text, flags=re.IGNORECASE)
+        text = pattern.sub(ph, text)
         placeholder_map[ph] = replacement
     return text, placeholder_map
 
