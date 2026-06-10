@@ -80,6 +80,34 @@ def _group_channels(guild_channels: dict, channel_id: int) -> dict:
             if info.get("group", "default") == my_group}
 
 
+def _ref_msg_link(ref_cluster: dict, channel_id: int, guild_id: int) -> str | None:
+    """Return a Discord jump URL for the given channel's copy of a ref_cluster message."""
+    msg_id = ref_cluster["channels"].get(channel_id)
+    if not msg_id:
+        return None
+    thread_id = ref_cluster.get("thread_channels", {}).get(channel_id)
+    link_ch = thread_id or channel_id
+    return f"https://discord.com/channels/{guild_id}/{link_ch}/{msg_id}"
+
+
+def _quoted_text(ref_cluster: dict, channel_id: int) -> str:
+    """Return the best available quoted text for a reply, falling back to attachment links."""
+    text = ref_cluster["contents"].get(channel_id, "")
+    if text:
+        return text
+    names = ref_cluster.get("att_names", {}).get(channel_id, [])
+    if not names:
+        return ""
+    source_ch = ref_cluster["source_ch"]
+    urls = (ref_cluster.get("att_urls", {}).get(channel_id)
+            or ref_cluster.get("att_urls", {}).get(source_ch, []))
+    parts = []
+    for i, name in enumerate(names):
+        url = urls[i] if i < len(urls) else None
+        parts.append(f"[{name}]({url})" if url else name)
+    return "📎 " + ", ".join(parts)
+
+
 def _guild_channels_for(channel_id: int) -> dict:
     """Return group-filtered channels for channel_id (supports thread channel IDs)."""
     for guild in bot.guilds:
@@ -229,18 +257,19 @@ async def on_message(message: discord.Message):
             if target_thread_id is None:
                 continue  # no corresponding thread in this channel
         target_lang = info["lang"]
-        quoted = ref_cluster["contents"].get(channel_id) if ref_cluster else None
+        quoted = _quoted_text(ref_cluster, channel_id) if ref_cluster else None
         quoted_author = ref_cluster.get("author") if ref_cluster else None
+        msg_link = _ref_msg_link(ref_cluster, channel_id, message.guild.id) if ref_cluster else None
         tasks.append(
             _raw_forward_send(
                 content, webhook_url, username, avatar_url, attachments, stickers,
-                quoted, quoted_author, target_thread_id,
+                quoted, quoted_author, target_thread_id, msg_link,
             ) if raw_forward else
             _translate_and_send(
                 content, source_lang, target_lang,
                 webhook_url, username, avatar_url,
                 attachments, stickers, quoted, quoted_author,
-                guild_glossary, guild_substitutions, target_thread_id,
+                guild_glossary, guild_substitutions, target_thread_id, msg_link,
             )
         )
         target_channel_ids.append(channel_id)
@@ -261,6 +290,7 @@ async def on_message(message: discord.Message):
         "source_lang": source_lang,
         "prefixes": {},
         "att_names": {source_ch_id: [a.filename for a in attachments]},
+        "att_urls":  {source_ch_id: [a.url for a in attachments]},
         "embed_count": len(message.embeds),
     }
     for ch_id, tid, result in zip(target_channel_ids, target_thread_ids, results):
@@ -269,18 +299,21 @@ async def on_message(message: discord.Message):
             cluster["channels"][ch_id] = sent_id
             cluster["contents"][ch_id] = sent_text or ""
             cluster["att_names"][ch_id] = [a.filename for a in attachments]
+            cluster["att_urls"][ch_id] = [a.url for a in attachments]
             if tid is not None:
                 cluster["thread_channels"][ch_id] = tid
 
     if ref_cluster:
         ref_author = ref_cluster.get("author", "")
         for ch_id in target_channel_ids:
-            quoted = ref_cluster["contents"].get(ch_id, "")
+            quoted = _quoted_text(ref_cluster, ch_id)
             if quoted:
+                link = _ref_msg_link(ref_cluster, ch_id, message.guild.id)
                 lines = quoted.splitlines()
                 pl: list[str] = []
                 if ref_author and lines:
-                    pl.append(f"> **{ref_author}**: {lines[0]}")
+                    first = f"**{ref_author}**: {lines[0]}"
+                    pl.append(f"> {first} [↗]({link})" if link else f"> {first}")
                     pl.extend(f"> {l}" for l in lines[1:])
                 else:
                     pl.extend(f"> {l}" for l in lines)
@@ -691,6 +724,7 @@ async def _raw_forward_send(
     quoted_content: str | None,
     quoted_author: str | None = None,
     thread_id: int | None = None,
+    msg_link: str | None = None,
 ) -> tuple[int, str] | None:
     files: list[discord.File] = []
     urls: list[tuple[str, str]] = (
@@ -714,7 +748,8 @@ async def _raw_forward_send(
     if quoted_content:
         lines = quoted_content.splitlines()
         if quoted_author and lines:
-            parts.append(f"> **{quoted_author}**: {lines[0]}")
+            first = f"**{quoted_author}**: {lines[0]}"
+            parts.append(f"> {first} [↗]({msg_link})" if msg_link else f"> {first}")
             parts.extend(f"> {line}" for line in lines[1:])
         else:
             parts.extend(f"> {line}" for line in lines)
@@ -750,6 +785,7 @@ async def _translate_and_send(
     glossary: dict | None = None,
     substitutions: dict | None = None,
     thread_id: int | None = None,
+    msg_link: str | None = None,
 ) -> tuple[int, str] | None:
     translated: str | None = None
     if text:
@@ -777,7 +813,8 @@ async def _translate_and_send(
     if quoted_content:
         lines = quoted_content.splitlines()
         if quoted_author and lines:
-            parts.append(f"> **{quoted_author}**: {lines[0]}")
+            first = f"**{quoted_author}**: {lines[0]}"
+            parts.append(f"> {first} [↗]({msg_link})" if msg_link else f"> {first}")
             parts.extend(f"> {line}" for line in lines[1:])
         else:
             parts.extend(f"> {line}" for line in lines)

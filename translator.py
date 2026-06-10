@@ -91,7 +91,7 @@ def _apply_glossary(text: str, dest: str, glossary: dict) -> tuple[str, dict[str
     """
     placeholder_map: dict[str, str] = {}
     for idx, (term, translations) in enumerate(glossary.items()):
-        if term not in text:
+        if not re.search(re.escape(term), text, flags=re.IGNORECASE):
             continue
         if dest in translations:
             replacement = translations[dest]
@@ -100,7 +100,7 @@ def _apply_glossary(text: str, dest: str, glossary: dict) -> tuple[str, dict[str
         else:
             continue
         ph = f"§{idx}§"
-        text = text.replace(term, ph)
+        text = re.sub(re.escape(term), ph, text, flags=re.IGNORECASE)
         placeholder_map[ph] = replacement
     return text, placeholder_map
 
