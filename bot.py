@@ -1,5 +1,8 @@
 import os
 import io
+import time
+import json
+import threading
 import asyncio
 import aiohttp
 import discord
@@ -20,6 +23,31 @@ from glossary import (
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# ── Hot-reload file watcher ────────────────────────────────────────────────
+# Polls the mtime of all source files every 10 s; calls os._exit(0) on any
+# change so Docker's restart policy brings the container back on new code.
+# Must use os._exit (not sys.exit) — sys.exit only unwinds the calling thread
+# and leaves the main process alive, silently preventing the reload.
+def _watch_source_files():
+    _root = os.path.dirname(os.path.abspath(__file__))
+    _watched = [
+        os.path.join(_root, f)
+        for f in ("bot.py", "translator.py", "config.py", "glossary.py")
+    ]
+    _mtimes = {f: os.path.getmtime(f) for f in _watched if os.path.exists(f)}
+    while True:
+        time.sleep(10)
+        for f in _watched:
+            try:
+                if os.path.getmtime(f) != _mtimes.get(f):
+                    print(f"[hot-reload] {os.path.basename(f)} changed — restarting", flush=True)
+                    os._exit(0)
+            except OSError:
+                pass
+
+threading.Thread(target=_watch_source_files, daemon=True).start()
+# ──────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -182,6 +210,15 @@ async def on_ready():
         print(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
         print(f"Failed to sync slash commands: {e}")
+
+    # Write a startup marker so deploy verification can confirm restart via SSH.
+    _status_file = os.environ.get("STATUS_FILE", "/data/status.json")
+    try:
+        os.makedirs(os.path.dirname(_status_file) or ".", exist_ok=True)
+        with open(_status_file, "w") as _f:
+            json.dump({"last_start": time.strftime("%Y-%m-%d %H:%M:%S")}, _f)
+    except Exception as _e:
+        print(f"[status write failed] {_e}")
 
 
 # ---------------------------------------------------------------------------
