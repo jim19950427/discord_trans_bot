@@ -58,6 +58,19 @@ def normalize_lang(code: str) -> str:
     return _SUPPORTED.get(code.lower(), code)
 
 
+def has_translatable_content(text: str) -> bool:
+    """True if translate_text has anything to actually send to the
+    translation engine once Discord mentions and custom emoji are
+    stripped out. A message that's purely mentions/custom-emoji/Unicode
+    emoji intentionally comes back unchanged from translate_text — callers
+    must not treat that as a translation failure and retry it."""
+    text = _MENTION_RE.sub("", text)
+    text = _CUSTOM_EMOJI_RE.sub("", text).strip()
+    if not text:
+        return False
+    return bool(_HAS_WORD_RE.search(text))
+
+
 def _log_translate_event(src: str, dest: str, text: str, result: str | None) -> None:
     """Append a translate call to a JSON log file, capped at LOG_MAX_ENTRIES
     (oldest entries dropped first). Thread-safe since translate calls run

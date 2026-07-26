@@ -9,7 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from translator import translate_text, translate_text_nocache, normalize_lang
+from translator import translate_text, translate_text_nocache, normalize_lang, has_translatable_content
 from config import load_channel_config, save_channel_config
 from glossary import (
     load_glossary, save_glossary, get_guild_glossary,
@@ -359,8 +359,10 @@ async def on_message(message: discord.Message):
     _store_cluster(cluster)
 
     # Schedule a delayed retry for channels where translation failed
-    # (sent text equals original source text — translation fell back to original)
-    if not raw_forward and content:
+    # (sent text equals original source text — translation fell back to original).
+    # Skip messages with nothing translatable (pure mention/custom-emoji/Unicode
+    # emoji) — those intentionally come back unchanged, that's not a failure.
+    if not raw_forward and content and has_translatable_content(content):
         for ch_id, result in zip(target_channel_ids, results):
             if result is None:
                 continue
