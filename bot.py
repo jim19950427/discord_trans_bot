@@ -486,6 +486,16 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     if not cluster:
         return
 
+    # Clear every sibling key for this cluster BEFORE awaiting the deletes
+    # below. The bot's own deletion of each mirror message also fires this
+    # same event, and without clearing synchronously first, those cascading
+    # events can each still find the cluster (since the delete gather below
+    # yields control) and redundantly re-run this whole handler for the same
+    # cluster — observed in production as the same message getting repeated
+    # "already deleted" 404s.
+    for msg_id in list(cluster["channels"].values()):
+        _msg_clusters.pop(msg_id, None)
+
     guild_channels = _guild_channels_for(payload.channel_id)
 
     await asyncio.gather(*[
@@ -495,9 +505,6 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
         and ch_id in guild_channels
         and guild_channels[ch_id].get("webhook_url")
     ])
-
-    for msg_id in list(cluster["channels"].values()):
-        _msg_clusters.pop(msg_id, None)
 
 
 @bot.event

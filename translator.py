@@ -114,17 +114,30 @@ def _log_translate_event(src: str, dest: str, text: str, result: str | None) -> 
 
 
 def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | None:
-    """Call Google Translate with retries for rate limits, untranslated results, and no-result errors."""
+    """Call Google Translate with retries for rate limits and no-result
+    errors (exponential backoff, up to `retries` attempts).
+
+    A result that equals the input isn't a transient failure — it means
+    this content just has no different translation (timestamps, leftover
+    glossary placeholders, decoratively-spaced text, etc.), so retrying
+    with the full exponential backoff only wastes time. That case gets its
+    own much smaller retry budget instead.
+    """
+    SAME_INPUT_RETRIES = 2
+    SAME_INPUT_WAIT = 1
+    same_input_attempts = 0
     for attempt in range(retries):
         try:
             result = GoogleTranslator(source=source, target=target).translate(text)
             if result and result.strip() != text.strip():
                 return result
             # Result equals input — Google returned original text unchanged.
-            if attempt < retries - 1:
-                wait = 2 ** attempt
-                log_event(f"[translate] result==input ({source}->{target}) attempt {attempt+1}, retrying in {wait}s")
-                time.sleep(wait)
+            same_input_attempts += 1
+            if same_input_attempts < SAME_INPUT_RETRIES:
+                log_event(f"[translate] result==input ({source}->{target}) attempt {same_input_attempts}, retrying in {SAME_INPUT_WAIT}s")
+                time.sleep(SAME_INPUT_WAIT)
+            else:
+                break
         except Exception as e:
             err = str(e).lower()
             retryable = any(k in err for k in (
@@ -142,12 +155,17 @@ def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | 
 
 
 def _source_variants(src: str) -> list[str]:
-    """Return source codes to try in order. CJK sources get extra fallbacks."""
+    """Return source codes to try in order. CJK sources get extra fallbacks.
+
+    Note: bare "zh" is deliberately not included — deep_translator's
+    GoogleTranslator only supports "zh-CN"/"zh-TW", and "zh" always raises
+    "No support for the provided language", wasting an API call every time.
+    """
     lower = src.lower()
     if lower == "zh-tw":
-        return [src, "zh-CN", "zh", "auto"]
+        return [src, "zh-CN", "auto"]
     if lower == "zh-cn":
-        return [src, "zh", "auto"]
+        return [src, "auto"]
     return [src, "auto"]
 
 
