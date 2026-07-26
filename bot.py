@@ -9,7 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from translator import translate_text, translate_text_nocache, normalize_lang, has_translatable_content
+from translator import translate_text, translate_text_nocache, normalize_lang, has_translatable_content, log_event
 from config import load_channel_config, save_channel_config
 from glossary import (
     load_glossary, save_glossary, get_guild_glossary,
@@ -41,7 +41,7 @@ def _watch_source_files():
         for f in _watched:
             try:
                 if os.path.getmtime(f) != _mtimes.get(f):
-                    print(f"[hot-reload] {os.path.basename(f)} changed — restarting", flush=True)
+                    log_event(f"[hot-reload] {os.path.basename(f)} changed — restarting")
                     os._exit(0)
             except OSError:
                 pass
@@ -83,7 +83,7 @@ FEEDBACK_EMOJI = "🔄"
 #   att_names      {channel_id: [filename, ...]}  for detecting attachment changes
 #   embed_count    number of embeds seen so far (for link-preview forwarding)
 _msg_clusters: dict[int, dict] = {}
-_MAX_CLUSTER_ENTRIES = int(os.getenv("MAX_CLUSTER_ENTRIES", "1500"))
+_MAX_CLUSTER_ENTRIES = int(os.getenv("MAX_CLUSTER_ENTRIES", "2000"))
 
 # Cached pinned message ID sets per channel for change detection
 _channel_pins: dict[int, set[int]] = {}
@@ -202,14 +202,14 @@ async def on_ready():
     if not _persist_clusters.is_running():
         _persist_clusters.start()
 
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"Loaded channel configs for {len(channel_configs)} guild(s)")
-    print(f"Restored {len(_msg_clusters)} msg clusters, {len(_thread_clusters)} thread clusters")
+    log_event(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    log_event(f"Loaded channel configs for {len(channel_configs)} guild(s)")
+    log_event(f"Restored {len(_msg_clusters)} msg clusters, {len(_thread_clusters)} thread clusters")
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
+        log_event(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
-        print(f"Failed to sync slash commands: {e}")
+        log_event(f"Failed to sync slash commands: {e}")
 
     # Write a startup marker so deploy verification can confirm restart via SSH.
     _status_file = os.environ.get("STATUS_FILE", "/data/status.json")
@@ -432,7 +432,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                     webhook = discord.Webhook.from_url(wh_url, session=session)
                     await webhook.edit_message(msg_id, embeds=current_embeds)
             except Exception as e:
-                print(f"Failed to forward embeds to channel {ch_id}: {e}")
+                log_event(f"Failed to forward embeds to channel {ch_id}: {e}")
 
     # --- Text / attachment edit ---
     if not new_content and not current_attachments and not current_stickers:
@@ -559,7 +559,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             msg = await ch.fetch_message(msg_id)
             await msg.add_reaction(payload.emoji)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            print(f"Failed to add reaction in channel {channel_id}: {e}")
+            log_event(f"Failed to add reaction in channel {channel_id}: {e}")
 
 
 @bot.event
@@ -581,7 +581,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
             msg = await ch.fetch_message(msg_id)
             await msg.remove_reaction(payload.emoji, bot.user)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            print(f"Failed to remove reaction in channel {channel_id}: {e}")
+            log_event(f"Failed to remove reaction in channel {channel_id}: {e}")
 
 
 @bot.event
@@ -601,7 +601,7 @@ async def on_raw_reaction_clear(payload: discord.RawReactionClearEvent):
             msg = await ch.fetch_message(msg_id)
             await msg.clear_reactions()
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            print(f"Failed to clear reactions in channel {channel_id}: {e}")
+            log_event(f"Failed to clear reactions in channel {channel_id}: {e}")
 
 
 @bot.event
@@ -621,7 +621,7 @@ async def on_raw_reaction_clear_emoji(payload: discord.RawReactionClearEmojiEven
             msg = await ch.fetch_message(msg_id)
             await msg.clear_reaction(payload.emoji)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            print(f"Failed to clear emoji reaction in channel {channel_id}: {e}")
+            log_event(f"Failed to clear emoji reaction in channel {channel_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -658,7 +658,7 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
                 await (await ch.fetch_message(cluster_msg_id)).pin()
                 _channel_pins.setdefault(ch_id, set()).add(cluster_msg_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-                print(f"Failed to pin {cluster_msg_id} in channel {ch_id}: {e}")
+                log_event(f"Failed to pin {cluster_msg_id} in channel {ch_id}: {e}")
 
     for msg_id in prev_ids - current_ids:
         cluster = _msg_clusters.get(msg_id)
@@ -676,7 +676,7 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
                 await (await ch.fetch_message(cluster_msg_id)).unpin()
                 _channel_pins.get(ch_id, set()).discard(cluster_msg_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-                print(f"Failed to unpin {cluster_msg_id} in channel {ch_id}: {e}")
+                log_event(f"Failed to unpin {cluster_msg_id} in channel {ch_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +714,7 @@ async def on_thread_create(thread: discord.Thread):
             )
             thread_map[ch_id] = new_thread.id
         except Exception as e:
-            print(f"[thread] failed to create in ch={ch_id}: {e}")
+            log_event(f"[thread] failed to create in ch={ch_id}: {e}")
 
     # Bidirectional index so any thread_id can look up the full mapping
     for tid in thread_map.values():
@@ -739,7 +739,7 @@ async def _retry_translate(
     await asyncio.sleep(delay)
     translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {})
     if not translated or translated.strip() == text.strip():
-        print(f"[retry] still failed ({src}->{dest}): {repr(text)}")
+        log_event(f"[retry] still failed ({src}->{dest}): {repr(text)}")
         return
     prefix = cluster.get("prefixes", {}).get(ch_id, "")
     full_content = f"{prefix}\n{translated}" if prefix else translated
@@ -748,9 +748,9 @@ async def _retry_translate(
             webhook = discord.Webhook.from_url(webhook_url, session=session)
             await webhook.edit_message(msg_id, content=full_content)
         cluster["contents"][ch_id] = translated
-        print(f"[retry] updated ({src}->{dest}): {repr(translated)}")
+        log_event(f"[retry] updated ({src}->{dest}): {repr(translated)}")
     except Exception as e:
-        print(f"[retry] edit failed msg={msg_id} ch={ch_id}: {e}")
+        log_event(f"[retry] edit failed msg={msg_id} ch={ch_id}: {e}")
 
 
 async def _raw_forward_send(
@@ -778,7 +778,7 @@ async def _raw_forward_send(
                         data = await resp.read()
                         files.append(discord.File(io.BytesIO(data), filename=filename))
         except Exception as e:
-            print(f"Download failed ({filename}): {e}")
+            log_event(f"Download failed ({filename}): {e}")
 
     if not text and not files:
         return None
@@ -843,7 +843,7 @@ async def _translate_and_send(
                         data = await resp.read()
                         files.append(discord.File(io.BytesIO(data), filename=filename))
         except Exception as e:
-            print(f"Download failed ({filename}): {e}")
+            log_event(f"Download failed ({filename}): {e}")
 
     if not translated and not files:
         return None
@@ -898,7 +898,7 @@ async def _translate_and_edit(
             webhook = discord.Webhook.from_url(webhook_url, session=session)
             await webhook.edit_message(msg_id, content=full_content)
     except Exception as e:
-        print(f"Failed to edit webhook message {msg_id} in channel {ch_id}: {e}")
+        log_event(f"Failed to edit webhook message {msg_id} in channel {ch_id}: {e}")
         return None
 
     return translated
@@ -910,7 +910,7 @@ async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> 
             webhook = discord.Webhook.from_url(webhook_url, session=session)
             await webhook.delete_message(msg_id)
     except Exception as e:
-        print(f"Failed to delete webhook message {msg_id} in channel {ch_id}: {e}")
+        log_event(f"Failed to delete webhook message {msg_id} in channel {ch_id}: {e}")
 
 
 async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_id: int) -> str | None:
@@ -944,10 +944,10 @@ async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_i
             webhook = discord.Webhook.from_url(webhook_url, session=session)
             await webhook.edit_message(msg_id, content=full_content)
         cluster["contents"][parent_ch_id] = translated
-        print(f"[retranslate] ({source_lang}->{target_lang}) updated msg={msg_id}")
+        log_event(f"[retranslate] ({source_lang}->{target_lang}) updated msg={msg_id}")
         return translated
     except Exception as e:
-        print(f"[retranslate] edit failed msg={msg_id}: {e}")
+        log_event(f"[retranslate] edit failed msg={msg_id}: {e}")
         return None
 
 

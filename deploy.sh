@@ -1,71 +1,73 @@
-#!/usr/bin/env bash
-# deploy.sh — upload source code to NAS via SSH pipe and trigger hot-reload
+#!/bin/bash
+# deploy.sh — 把程式碼上傳到 DSM（Synology NAS）的 docker 資料夾。
 #
-# Daily usage:   ./deploy.sh
-# Dependency update: ./deploy.sh --with-deps
+# NAS 不支援 scp/rsync，改用 SSH pipe（cat 檔案 | ssh 'cat > 目標'）。
+# 上傳後容器內的 file watcher 偵測到 mtime 變更會自動重啟，不需手動動 NAS。
 #
-# First-time setup:
-#   1. Fill in the settings block below.
-#   2. Set up SSH key auth: ssh-copy-id NAS_USER@NAS_IP
-#   3. chmod +x deploy.sh
-#   4. Restart the container once manually (DSM Container Manager → restart)
-#      so the hot-reload watcher takes effect for the first time.
-
-# ── Settings ────────────────────────────────────────────────────────────────
-NAS="nas_user@192.168.x.x"                       # ← SSH user@host for your NAS
-DEST="/volume1/docker/discord_trans_bot"          # ← project folder on NAS
-STATUS_FILE="$DEST/data/status.json"              # ← matches STATUS_FILE env var
-
-# Files uploaded on every deploy
-CODE_FILES=(bot.py translator.py config.py glossary.py)
-
-# Files uploaded only with --with-deps
-DEP_FILES=(docker-compose.yml Dockerfile requirements.txt)
-# ────────────────────────────────────────────────────────────────────────────
-
+# 用法：
+#   ./deploy.sh              只上傳程式碼（bot.py 等）— 日常改碼用
+#   ./deploy.sh --with-deps  連 docker-compose.yml / Dockerfile / requirements.txt
+#                            一起上傳（首次部署或改依賴時用；改依賴後仍需在
+#                            Container Manager 重建 image）
 set -e
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── 設定 ──────────────────────────────────────────────
+NAS="jim@192.168.1.11"
+DEST="/volume1/docker/discord-trans-bot"
+DIR="$(cd "$(dirname "$0")" && pwd)"
+
+CODE_FILES=(bot.py translator.py config.py glossary.py)
+DEP_FILES=(docker-compose.yml Dockerfile requirements.txt)
+
+# ── 顏色 ──────────────────────────────────────────────
+RED='\033[91m'; GREEN='\033[92m'; CYAN='\033[96m'; YELLOW='\033[93m'; BOLD='\033[1m'; RESET='\033[0m'
+success() { echo -e "${GREEN}${BOLD}[ OK ]${RESET}  $*"; }
+info()    { echo -e "${CYAN}${BOLD}[INFO]${RESET}  $*"; }
+warn()    { echo -e "${YELLOW}${BOLD}[WARN]${RESET}  $*"; }
+error()   { echo -e "${RED}${BOLD}[ERR ]${RESET}  $*"; exit 1; }
+
+# 上傳單一檔案（SSH pipe）
 upload() {
-    local src="$1" dst="$2"
-    echo "  uploading $src → $dst"
-    cat "$src" | ssh "$NAS" "cat > '$dst'"
+    local f="$1"
+    [ -f "${DIR}/${f}" ] || error "找不到檔案：${f}"
+    if cat "${DIR}/${f}" | ssh "$NAS" "cat > '${DEST}/${f}'"; then
+        success "${f}  →  ${NAS}:${DEST}/${f}"
+    else
+        error "上傳失敗：${f}"
+    fi
 }
 
-die() { echo "ERROR: $1" >&2; exit 1; }
+echo -e "\n${BOLD}${CYAN}🚀  Discord Trans Bot — 部署到 DSM${RESET}\n"
 
-# ── Pre-flight ───────────────────────────────────────────────────────────────
-ssh "$NAS" "test -d '$DEST'" || die "DEST dir '$DEST' not found on NAS. Check NAS / DEST settings."
-
-# ── Upload ───────────────────────────────────────────────────────────────────
-echo "==> Uploading code files…"
-for f in "${CODE_FILES[@]}"; do
-    upload "$f" "$DEST/$f"
-done
-
-if [[ "$1" == "--with-deps" ]]; then
-    echo "==> Uploading dependency files…"
-    for f in "${DEP_FILES[@]}"; do
-        upload "$f" "$DEST/$f"
-    done
-    echo ""
-    echo "NOTE: dependency files updated. Rebuild the Docker image in DSM Container"
-    echo "      Manager (or run: docker compose up -d --build) for changes to take effect."
+# 決定要上傳哪些檔案
+FILES=("${CODE_FILES[@]}")
+WITH_DEPS=0
+if [ "$1" == "--with-deps" ]; then
+    WITH_DEPS=1
+    FILES=("${CODE_FILES[@]}" "${DEP_FILES[@]}")
+    info "模式：程式碼 + 部署設定（--with-deps）"
+else
+    info "模式：只上傳程式碼（bot.py translator.py config.py glossary.py）"
 fi
 
-# ── Wait for restart ─────────────────────────────────────────────────────────
-echo ""
-echo "==> Waiting for container to restart (up to ~30 s)…"
-OLD_START=$(ssh "$NAS" "cat '$STATUS_FILE' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('last_start',''))\" 2>/dev/null" || true)
+# 連線測試
+info "測試 SSH 連線 ${NAS} ..."
+ssh -o ConnectTimeout=8 "$NAS" "test -d '${DEST}'" \
+    || error "無法連線或找不到目錄 ${DEST}（確認 SSH key 與路徑）"
+success "連線正常，目標目錄存在"
 
-for i in $(seq 1 20); do
-    sleep 3
-    NEW_START=$(ssh "$NAS" "cat '$STATUS_FILE' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('last_start',''))\" 2>/dev/null" || true)
-    if [[ -n "$NEW_START" && "$NEW_START" != "$OLD_START" ]]; then
-        echo "✓ Container restarted at $NEW_START"
-        exit 0
-    fi
+echo ""
+for f in "${FILES[@]}"; do
+    upload "$f"
 done
 
-echo "⚠️  Timed out waiting for restart. The watcher should still trigger within 10 s."
-echo "   Check DSM Container Manager logs if the container hasn't restarted."
+echo ""
+success "上傳完成"
+info  "容器 file watcher 會在 ~10 秒內偵測變更並自動重啟"
+
+if [ "$WITH_DEPS" -eq 1 ]; then
+    echo ""
+    warn "你上傳了 requirements.txt / Dockerfile。"
+    warn "依賴或 image 有變動時，需到 DSM Container Manager 重建 image 才會生效。"
+fi
+echo ""

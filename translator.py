@@ -9,8 +9,8 @@ from deep_translator import GoogleTranslator
 CACHE_DIR = os.getenv("TRANSLATE_CACHE_DIR", "/data/translate_cache")
 CACHE_SIZE_LIMIT = int(os.getenv("TRANSLATE_CACHE_SIZE_LIMIT", str(50 * 1024 * 1024)))
 
-LOG_FILE = os.getenv("TRANSLATE_LOG_FILE", "/data/translate_log.json")
-LOG_MAX_ENTRIES = int(os.getenv("TRANSLATE_LOG_MAX_ENTRIES", "500"))
+LOG_FILE = os.getenv("BOT_LOG_FILE", "/data/bot_log.json")
+LOG_MAX_ENTRIES = int(os.getenv("BOT_LOG_MAX_ENTRIES", "2000"))
 _log_lock = threading.Lock()
 
 _translate_cache: diskcache.Cache | None = None
@@ -71,16 +71,18 @@ def has_translatable_content(text: str) -> bool:
     return bool(_HAS_WORD_RE.search(text))
 
 
-def _log_translate_event(src: str, dest: str, text: str, result: str | None) -> None:
-    """Append a translate call to a JSON log file, capped at LOG_MAX_ENTRIES
-    (oldest entries dropped first). Thread-safe since translate calls run
-    concurrently across multiple worker threads (asyncio.to_thread)."""
+def log_event(message: str, **fields) -> None:
+    """Print message to the console (unchanged, still visible in the DSM log
+    viewer) and also append a structured entry to a shared JSON log file,
+    capped at LOG_MAX_ENTRIES entries (oldest dropped first). Thread-safe —
+    bot events and translate calls both come from concurrent worker threads.
+    """
+    print(message)
     entry = {
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "src": src,
-        "dest": dest,
-        "input": text,
-        "output": result,
+        "type": fields.pop("type", "info"),
+        "message": message,
+        **fields,
     }
     with _log_lock:
         try:
@@ -96,7 +98,12 @@ def _log_translate_event(src: str, dest: str, text: str, result: str | None) -> 
             with open(LOG_FILE, "w", encoding="utf-8") as f:
                 json.dump(entries, f, ensure_ascii=False)
         except OSError as e:
-            print(f"[translate log write failed] {e}")
+            print(f"[log write failed] {e}")
+
+
+def _log_translate_event(src: str, dest: str, text: str, result: str | None) -> None:
+    message = f"[translate] ({src}->{dest}) {repr(text)} -> {repr(result)}"
+    log_event(message, type="translate", src=src, dest=dest, input=text, output=result)
 
 
 def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | None:
@@ -109,7 +116,7 @@ def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | 
             # Result equals input — Google returned original text unchanged.
             if attempt < retries - 1:
                 wait = 2 ** attempt
-                print(f"[translate] result==input ({source}->{target}) attempt {attempt+1}, retrying in {wait}s")
+                log_event(f"[translate] result==input ({source}->{target}) attempt {attempt+1}, retrying in {wait}s")
                 time.sleep(wait)
         except Exception as e:
             err = str(e).lower()
@@ -119,10 +126,10 @@ def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | 
             if retryable:
                 if attempt < retries - 1:
                     wait = 2 ** attempt
-                    print(f"[translate] retryable error ({source}->{target}) attempt {attempt+1}: {e}, retrying in {wait}s")
+                    log_event(f"[translate] retryable error ({source}->{target}) attempt {attempt+1}: {e}, retrying in {wait}s")
                     time.sleep(wait)
                 continue
-            print(f"Google Translate error (source={source}, target={target}): {e}")
+            log_event(f"Google Translate error (source={source}, target={target}): {e}")
             break
     return None
 
@@ -280,7 +287,7 @@ def translate_text(
     ):
         block_result = (_cached_translate if _use_cache else _translate_with_fallback)(clean, src, dest)
         if not block_result:
-            print(f"[translate] all attempts failed ({src}->{dest}): {repr(clean)}")
+            log_event(f"[translate] all attempts failed ({src}->{dest}): {repr(clean)}")
             block_result = clean
         if emojis:
             block_result = block_result + "  " + " ".join(emojis)
@@ -321,7 +328,7 @@ def translate_text(
             line_result = (_cached_translate if _use_cache else _translate_with_fallback)(segment, src, dest)
 
         if not line_result:
-            print(f"[translate] all attempts failed ({src}->{dest}): {repr(segment)}")
+            log_event(f"[translate] all attempts failed ({src}->{dest}): {repr(segment)}")
             translated_lines.append(line_stripped)
             continue
 
