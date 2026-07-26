@@ -1,11 +1,17 @@
 import os
 import re
+import json
 import time
+import threading
 import diskcache
 from deep_translator import GoogleTranslator
 
 CACHE_DIR = os.getenv("TRANSLATE_CACHE_DIR", "/data/translate_cache")
 CACHE_SIZE_LIMIT = int(os.getenv("TRANSLATE_CACHE_SIZE_LIMIT", str(50 * 1024 * 1024)))
+
+LOG_FILE = os.getenv("TRANSLATE_LOG_FILE", "/data/translate_log.json")
+LOG_MAX_ENTRIES = int(os.getenv("TRANSLATE_LOG_MAX_ENTRIES", "500"))
+_log_lock = threading.Lock()
 
 _translate_cache: diskcache.Cache | None = None
 
@@ -52,6 +58,34 @@ def normalize_lang(code: str) -> str:
     return _SUPPORTED.get(code.lower(), code)
 
 
+def _log_translate_event(src: str, dest: str, text: str, result: str | None) -> None:
+    """Append a translate call to a JSON log file, capped at LOG_MAX_ENTRIES
+    (oldest entries dropped first). Thread-safe since translate calls run
+    concurrently across multiple worker threads (asyncio.to_thread)."""
+    entry = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "src": src,
+        "dest": dest,
+        "input": text,
+        "output": result,
+    }
+    with _log_lock:
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                entries = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            entries = []
+        entries.append(entry)
+        if len(entries) > LOG_MAX_ENTRIES:
+            entries = entries[-LOG_MAX_ENTRIES:]
+        try:
+            os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                json.dump(entries, f, ensure_ascii=False)
+        except OSError as e:
+            print(f"[translate log write failed] {e}")
+
+
 def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | None:
     """Call Google Translate with retries for rate limits, untranslated results, and no-result errors."""
     for attempt in range(retries):
@@ -95,7 +129,9 @@ def _translate_with_fallback(text: str, src: str, dest: str) -> str | None:
     for source in _source_variants(src):
         result = _try_google(text, source, dest)
         if result:
+            _log_translate_event(src, dest, text, result)
             return result
+    _log_translate_event(src, dest, text, None)
     return None
 
 
@@ -107,9 +143,7 @@ def _cached_translate(text: str, src: str, dest: str, cache: diskcache.Cache | N
     if key in cache:
         return cache[key]
 
-    print(f"[translate] ({src}->{dest}) input: {repr(text)}")
     result = _translate_with_fallback(text, src, dest)
-    print(f"[translate] ({src}->{dest}) output: {repr(result)}")
 
     if result is not None:
         cache[key] = result
@@ -201,6 +235,44 @@ def translate_text(
     # deep-translator / unofficial Google API bug where only the first line
     # gets translated when the input contains newlines.
     lines = clean.splitlines()
+
+    def _line_needs_extraction(line: str) -> bool:
+        """True if this line mixes translatable words with a Unicode emoji
+        or URL, which need to be pulled out before translation. A blank
+        line or one that's entirely emoji/URL (no other words once those
+        are removed) passes through untouched either way, so it doesn't
+        force per-line handling — mirrors the per-line loop's own segment
+        check below.
+        """
+        stripped = line.strip()
+        if not stripped:
+            return False
+        remainder = _URL_RE.sub("", _UNICODE_EMOJI_RE.sub("", stripped)).strip()
+        if not remainder or not _HAS_WORD_RE.search(remainder):
+            return False
+        return bool(_UNICODE_EMOJI_RE.search(stripped) or _URL_RE.search(stripped))
+
+    # Fast path: a message manually broken across multiple lines (a common
+    # casual chat style, e.g. one word/phrase per line for emphasis) loses
+    # all sentence context when each line is translated independently —
+    # e.g. "打破" alone becomes "break in" instead of "break". If no line
+    # needs special handling (glossary match, or a Unicode emoji/URL mixed
+    # in with real words), translate the whole block in one call so Google
+    # keeps cross-line context. A trailing emoji-only line (very common)
+    # doesn't block this — Google passes it through untouched regardless.
+    if (
+        len(lines) > 1
+        and not glossary
+        and not any(_line_needs_extraction(line) for line in lines)
+    ):
+        block_result = (_cached_translate if _use_cache else _translate_with_fallback)(clean, src, dest)
+        if not block_result:
+            print(f"[translate] all attempts failed ({src}->{dest}): {repr(clean)}")
+            block_result = clean
+        if emojis:
+            block_result = block_result + "  " + " ".join(emojis)
+        return _with_mentions(block_result)
+
     translated_lines: list[str] = []
     for line in lines:
         line_stripped = line.strip()

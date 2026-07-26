@@ -77,6 +77,8 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 # MAX_CLUSTER_ENTRIES=1500            ← 追蹤訊息上限（預設 1500，超過時自動淘汰最舊的）
 # TRANSLATE_CACHE_DIR=/data/translate_cache   ← 翻譯快取目錄（預設值如左，已包含在 data volume 內，重啟不會消失）
 # TRANSLATE_CACHE_SIZE_LIMIT=52428800         ← 翻譯快取容量上限，單位 bytes（預設 50MB，超過時自動淘汰最少使用的項目）
+# TRANSLATE_LOG_FILE=/data/translate_log.json ← 翻譯紀錄檔（JSON），方便除錯查詢實際送給翻譯引擎的內容
+# TRANSLATE_LOG_MAX_ENTRIES=500               ← 翻譯紀錄檔上限筆數（預設 500，超過時自動淘汰最舊的紀錄）
 ```
 
 > 若 File Station 不允許建立以點開頭的檔案，可先命名為 `env.txt` 上傳後再改名，或透過 SSH 建立。
