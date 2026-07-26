@@ -10,7 +10,7 @@ CACHE_DIR = os.getenv("TRANSLATE_CACHE_DIR", "/data/translate_cache")
 CACHE_SIZE_LIMIT = int(os.getenv("TRANSLATE_CACHE_SIZE_LIMIT", str(50 * 1024 * 1024)))
 
 LOG_FILE = os.getenv("BOT_LOG_FILE", "/data/bot_log.json")
-LOG_MAX_ENTRIES = int(os.getenv("BOT_LOG_MAX_ENTRIES", "2000"))
+LOG_MAX_ENTRIES = int(os.getenv("BOT_LOG_MAX_ENTRIES", "5000"))
 _log_lock = threading.Lock()
 
 _translate_cache: diskcache.Cache | None = None
@@ -60,12 +60,14 @@ def normalize_lang(code: str) -> str:
 
 def has_translatable_content(text: str) -> bool:
     """True if translate_text has anything to actually send to the
-    translation engine once Discord mentions and custom emoji are
-    stripped out. A message that's purely mentions/custom-emoji/Unicode
-    emoji intentionally comes back unchanged from translate_text — callers
-    must not treat that as a translation failure and retry it."""
+    translation engine once Discord mentions, custom emoji, Unicode emoji,
+    and URLs are stripped out. A message that's purely made of those
+    intentionally comes back unchanged from translate_text — callers must
+    not treat that as a translation failure and retry it."""
     text = _MENTION_RE.sub("", text)
-    text = _CUSTOM_EMOJI_RE.sub("", text).strip()
+    text = _CUSTOM_EMOJI_RE.sub("", text)
+    text = _UNICODE_EMOJI_RE.sub("", text)
+    text = _URL_RE.sub("", text).strip()
     if not text:
         return False
     return bool(_HAS_WORD_RE.search(text))

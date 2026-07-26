@@ -78,7 +78,7 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 # TRANSLATE_CACHE_DIR=/data/translate_cache   ← 翻譯快取目錄（預設值如左，已包含在 data volume 內，重啟不會消失）
 # TRANSLATE_CACHE_SIZE_LIMIT=52428800         ← 翻譯快取容量上限，單位 bytes（預設 50MB，超過時自動淘汰最少使用的項目）
 # BOT_LOG_FILE=/data/bot_log.json      ← 機器人運作紀錄檔（JSON），涵蓋翻譯呼叫與所有錯誤/事件訊息，方便除錯查詢
-# BOT_LOG_MAX_ENTRIES=2000             ← 紀錄檔上限筆數（預設 2000，超過時自動淘汰最舊的紀錄）
+# BOT_LOG_MAX_ENTRIES=5000             ← 紀錄檔上限筆數（預設 5000，超過時自動淘汰最舊的紀錄）
 ```
 
 > 若 File Station 不允許建立以點開頭的檔案，可先命名為 `env.txt` 上傳後再改名，或透過 SSH 建立。
