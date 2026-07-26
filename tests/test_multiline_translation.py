@@ -89,3 +89,43 @@ def test_single_line_message_unaffected(monkeypatch):
 
     assert result == "hi there"
     mock_translate.assert_called_once()
+
+
+def test_unrelated_glossary_does_not_block_fast_path(monkeypatch):
+    """Regression test for a real incident: a guild-wide glossary of proper
+    nouns (e.g. "Jim", "Maria") disabled the fast path for every message on
+    that guild, even when the message never used any of those terms —
+    because the old check was "does this guild have any glossary" instead
+    of "does this line actually match one".
+    """
+    mock_translate = Mock(return_value="translated block")
+    monkeypatch.setattr(translator, "_translate_with_fallback", mock_translate)
+
+    glossary = {"Jim": {"*": "Jim"}, "Maria": {"*": "Maria"}}
+    text = "帥氣的\n不要\n打破\n我的\n幻想"
+    translator.translate_text(text, "zh-TW", "en", glossary=glossary, _use_cache=False)
+
+    mock_translate.assert_called_once_with(text, "zh-TW", "en")
+
+
+def test_hidden_control_characters_do_not_fragment_message(monkeypatch):
+    """Regression test for a real production incident: a message copy-pasted
+    from another app contained hidden \\x1d (Group Separator) control
+    characters between nearly every word. Discord never renders them, but
+    str.splitlines() treats them as line breaks, fragmenting the message
+    into per-word translate calls and destroying all context (e.g. "如果"
+    alone -> "if", "错" alone -> "wrong", instead of one coherent sentence).
+    """
+    mock_translate = Mock(return_value="translated whole block")
+    monkeypatch.setattr(translator, "_translate_with_fallback", mock_translate)
+
+    text = (
+        "如果\x1d\x1d是\x1d\x1d我\x1d\x1d的\x1d\x1d错\x1d\x1d的话\x1d\x1d非常\x1d\x1d非常"
+        "\x1d\x1d抱歉\x1d\x1d知道\x1d\x1dbut I know it's not my fault \n"
+        "谢谢\x1d\x1d担心\x1d\x1d我\x1d mmmmmmuwahhhhh"
+    )
+    translator.translate_text(text, "zh-TW", "en", _use_cache=False)
+
+    mock_translate.assert_called_once()
+    called_text = mock_translate.call_args[0][0]
+    assert "\x1d" not in called_text

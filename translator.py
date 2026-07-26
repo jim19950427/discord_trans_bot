@@ -52,6 +52,11 @@ _UNICODE_EMOJI_RE = re.compile(
 _URL_RE = re.compile(r"https?://\S+")
 # Matches any real word character (letters/digits from any script, incl. CJK)
 _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
+# Characters str.splitlines() treats as line boundaries but that Discord
+# never renders as visible line breaks — typically invisible copy-paste
+# artifacts (e.g. \x1d Group Separator) from other apps. Left in place,
+# they fragment a message into spurious per-word "lines" during translation.
+_STRAY_LINEBREAK_RE = re.compile("[\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 
 
 def normalize_lang(code: str) -> str:
@@ -226,6 +231,14 @@ def translate_text(
     if src == dest:
         return None
 
+    # Normalize real line breaks, then strip stray control characters that
+    # str.splitlines() would otherwise treat as line boundaries (see
+    # _STRAY_LINEBREAK_RE comment) — these are invisible copy-paste
+    # artifacts, not intentional line breaks, and must not fragment the
+    # message into per-word "lines" below.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = _STRAY_LINEBREAK_RE.sub("", text)
+
     # Pull out Discord mentions before anything else touches the text (see
     # _MENTION_RE comment for why).
     mentions = _MENTION_RE.findall(text)
@@ -256,7 +269,10 @@ def translate_text(
     # Split by newlines and translate each line independently to avoid a
     # deep-translator / unofficial Google API bug where only the first line
     # gets translated when the input contains newlines.
-    lines = clean.splitlines()
+    # Use split("\n") rather than splitlines() — splitlines() also breaks on
+    # \v, \f, \x1c-\x1e, \x85, U+2028/U+2029, none of which Discord renders
+    # as a line break, so treating them as one would fragment the message.
+    lines = clean.split("\n")
 
     def _line_needs_extraction(line: str) -> bool:
         """True if this line mixes translatable words with a Unicode emoji
@@ -274,18 +290,33 @@ def translate_text(
             return False
         return bool(_UNICODE_EMOJI_RE.search(stripped) or _URL_RE.search(stripped))
 
+    def _line_matches_glossary(line: str) -> bool:
+        """True if this line actually contains a glossary term that would
+        produce a placeholder for this dest language — mirrors _apply_glossary's
+        own matching logic. A guild simply *having* a glossary configured
+        (e.g. proper nouns like "Jim") must not disable the fast path for
+        every message on that guild; only a real match on this line should.
+        """
+        if not glossary:
+            return False
+        for term, translations in glossary.items():
+            if dest not in translations and "*" not in translations:
+                continue
+            if _term_pattern(term).search(line):
+                return True
+        return False
+
     # Fast path: a message manually broken across multiple lines (a common
     # casual chat style, e.g. one word/phrase per line for emphasis) loses
     # all sentence context when each line is translated independently —
     # e.g. "打破" alone becomes "break in" instead of "break". If no line
-    # needs special handling (glossary match, or a Unicode emoji/URL mixed
-    # in with real words), translate the whole block in one call so Google
-    # keeps cross-line context. A trailing emoji-only line (very common)
-    # doesn't block this — Google passes it through untouched regardless.
+    # needs special handling (a real glossary match, or a Unicode emoji/URL
+    # mixed in with real words), translate the whole block in one call so
+    # Google keeps cross-line context. A trailing emoji-only line (very
+    # common) doesn't block this — Google passes it through unchanged either way.
     if (
         len(lines) > 1
-        and not glossary
-        and not any(_line_needs_extraction(line) for line in lines)
+        and not any(_line_needs_extraction(line) or _line_matches_glossary(line) for line in lines)
     ):
         block_result = (_cached_translate if _use_cache else _translate_with_fallback)(clean, src, dest)
         if not block_result:
