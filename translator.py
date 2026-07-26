@@ -29,6 +29,11 @@ _SUPPORTED: dict[str, str] = {
 
 # Discord custom emoji: <:name:id> or animated <a:name:id>
 _CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
+# Discord mentions: <@id>, <@!id> (nickname), <@&id> (role), <#id> (channel).
+# Must be extracted before substitutions/glossary/translation touch the text —
+# none of those steps understand mention syntax, and a substitution or
+# glossary term that happens to be a substring of the numeric ID corrupts it.
+_MENTION_RE = re.compile(r"<@[!&]?\d+>|<#\d+>")
 # Unicode emoji ranges (covers the vast majority of emoji in common use)
 _UNICODE_EMOJI_RE = re.compile(
     "[\U0001F000-\U0001FAFF"  # Mahjong–Symbols and Pictographs Extended-A
@@ -165,6 +170,17 @@ def translate_text(
     if src == dest:
         return None
 
+    # Pull out Discord mentions before anything else touches the text (see
+    # _MENTION_RE comment for why).
+    mentions = _MENTION_RE.findall(text)
+    text = _MENTION_RE.sub("", text).strip()
+
+    def _with_mentions(body: str) -> str:
+        if not mentions:
+            return body
+        parts = [p for p in (body, " ".join(mentions)) if p]
+        return "  ".join(parts)
+
     # Apply pre-translation substitutions (e.g. aliases / euphemisms)
     if substitutions:
         for src_term, replacement in substitutions.items():
@@ -175,11 +191,11 @@ def translate_text(
     clean = _CUSTOM_EMOJI_RE.sub("", text).strip()
 
     if not clean:
-        return text if emojis else None
+        return _with_mentions(text) if (emojis or mentions) else None
 
     # Unicode emoji only (👀) — forward verbatim, translation would mangle them
     if not _HAS_WORD_RE.search(clean):
-        return text
+        return _with_mentions(text)
 
     # Split by newlines and translate each line independently to avoid a
     # deep-translator / unofficial Google API bug where only the first line
@@ -233,12 +249,12 @@ def translate_text(
 
     result = "\n".join(translated_lines)
     if not result:
-        return None
+        return _with_mentions("") if mentions else None
 
     if emojis:
         result = result + "  " + " ".join(emojis)
 
-    return result
+    return _with_mentions(result)
 
 
 def translate_text_nocache(
