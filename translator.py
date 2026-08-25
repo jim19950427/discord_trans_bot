@@ -4,7 +4,42 @@ import json
 import time
 import threading
 import diskcache
+import deep_translator.google as _deep_google
 from deep_translator import GoogleTranslator
+
+# ── Google Translate scraper hardening ────────────────────────────────────
+# deep-translator calls requests.get() without a User-Agent, so requests sends
+# "python-requests/x.y". Google began blocking that UA in Aug 2026: it answers
+# HTTP 200 (so deep-translator's status-code check passes) but puts its own
+# "Error 500 (Server Error)" page in the result slot instead of a translation.
+# A browser UA gets normal results from the very same endpoint.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
+class _UARequestsProxy:
+    """Wraps the requests module so every GET carries a browser User-Agent.
+
+    deep-translator exposes no hook for request headers, so the only place to
+    inject one is the `requests` reference inside its google module.
+    """
+
+    def __init__(self, real):
+        self._real = real
+
+    def get(self, *args, **kwargs):
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers.setdefault("User-Agent", _BROWSER_UA)
+        return self._real.get(*args, headers=headers, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+if not isinstance(_deep_google.requests, _UARequestsProxy):
+    _deep_google.requests = _UARequestsProxy(_deep_google.requests)
 
 CACHE_DIR = os.getenv("TRANSLATE_CACHE_DIR", "/data/translate_cache")
 CACHE_SIZE_LIMIT = int(os.getenv("TRANSLATE_CACHE_SIZE_LIMIT", str(50 * 1024 * 1024)))
@@ -57,6 +92,27 @@ _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
 # artifacts (e.g. \x1d Group Separator) from other apps. Left in place,
 # they fragment a message into spurious per-word "lines" during translation.
 _STRAY_LINEBREAK_RE = re.compile("[\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+# Google's /m endpoint answers HTTP 200 even when it fails, embedding its own
+# error page in the result slot — so deep-translator returns that page's text
+# as if it were a translation. It doesn't equal the input, so the plain
+# result!=input check accepts it, and _cached_translate then stores the garbage
+# permanently. These markers are Google's error-page signature: a "Error NNN
+# (Server Error)" banner and the "That's all we know." footer. Both are far too
+# distinctive to collide with real chat text, and _looks_like_error_page still
+# refuses to fire when the source text already contained the marker itself.
+_ERROR_PAGE_RE = re.compile(
+    r"error \d{3} \(server error\)|that['\u2019]s all we know",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_error_page(result: str, source_text: str) -> bool:
+    """True if `result` is Google's error page rather than a translation."""
+    if not _ERROR_PAGE_RE.search(result):
+        return False
+    # Don't misfire on a message that genuinely contains the phrase.
+    return not _ERROR_PAGE_RE.search(source_text)
+
 
 
 def normalize_lang(code: str) -> str:
@@ -125,10 +181,29 @@ def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | 
     """
     SAME_INPUT_RETRIES = 2
     SAME_INPUT_WAIT = 1
+    # An error page means Google itself is failing, not that we were throttled.
+    # When it happens it tends to be persistent (a blocked client, a broken
+    # endpoint), so probing briefly and then degrading to untranslated text
+    # beats stalling every language of every message on the full backoff.
+    ERROR_PAGE_RETRIES = 2
+    ERROR_PAGE_WAIT = 1
     same_input_attempts = 0
+    error_page_attempts = 0
     for attempt in range(retries):
         try:
             result = GoogleTranslator(source=source, target=target).translate(text)
+            if result and _looks_like_error_page(result, text):
+                # Never return or cache this — it would be posted to Discord as
+                # if it were the translation.
+                error_page_attempts += 1
+                log_event(
+                    f"[translate] error page from Google ({source}->{target}) "
+                    f"attempt {error_page_attempts}: {result[:80]!r}"
+                )
+                if error_page_attempts < ERROR_PAGE_RETRIES:
+                    time.sleep(ERROR_PAGE_WAIT)
+                    continue
+                break
             if result and result.strip() != text.strip():
                 return result
             # Result equals input — Google returned original text unchanged.
