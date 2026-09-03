@@ -315,7 +315,15 @@ async def on_message(message: discord.Message):
     if not tasks:
         return
 
-    results = await asyncio.gather(*tasks)
+    # return_exceptions=True: one channel's send failing (e.g. an unhandled
+    # discord.HTTPException) must not abort the cluster build below — that
+    # would silently drop every OTHER channel's already-sent message from
+    # tracking too, breaking edit/delete/pin sync for them as well.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for ch_id, result in zip(target_channel_ids, results):
+        if isinstance(result, BaseException):
+            log_event(f"[forward] task failed for channel {ch_id}: {result}")
+    results = [None if isinstance(r, BaseException) else r for r in results]
 
     cluster: dict = {
         "channels": {source_ch_id: message.id},
@@ -811,10 +819,15 @@ async def _raw_forward_send(
     if thread_id:
         send_kwargs["thread"] = discord.Object(id=thread_id)
 
-    async with aiohttp.ClientSession() as session:
-        webhook = discord.Webhook.from_url(webhook_url, session=session)
-        msg = await webhook.send(**send_kwargs)
-        return msg.id, text or ""
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            msg = await webhook.send(**send_kwargs)
+            return msg.id, text or ""
+    except Exception as e:
+        # Never log webhook_url — it embeds the webhook's auth token.
+        log_event(f"[forward] send failed (author={username!r}, files={len(files)}): {e}")
+        return None
 
 
 async def _translate_and_send(
@@ -876,10 +889,15 @@ async def _translate_and_send(
     if thread_id:
         send_kwargs["thread"] = discord.Object(id=thread_id)
 
-    async with aiohttp.ClientSession() as session:
-        webhook = discord.Webhook.from_url(webhook_url, session=session)
-        msg = await webhook.send(**send_kwargs)
-        return msg.id, translated or ""
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            msg = await webhook.send(**send_kwargs)
+            return msg.id, translated or ""
+    except Exception as e:
+        # Never log webhook_url — it embeds the webhook's auth token.
+        log_event(f"[forward] send failed (author={username!r}, dest={dest}, files={len(files)}): {e}")
+        return None
 
 
 async def _translate_and_edit(
@@ -918,6 +936,106 @@ async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> 
             await webhook.delete_message(msg_id)
     except Exception as e:
         log_event(f"Failed to delete webhook message {msg_id} in channel {ch_id}: {e}")
+
+
+class _ClusterAttachment:
+    """Stand-in for discord.Attachment, built from the url/filename pairs a
+    cluster already persists. Only .url/.filename are read by the download
+    helpers in _translate_and_send / _raw_forward_send, so this is enough to
+    re-run a forward without the original discord.Message object."""
+    __slots__ = ("url", "filename")
+
+    def __init__(self, url: str, filename: str):
+        self.url = url
+        self.filename = filename
+
+
+async def _retry_missing_channels(cluster: dict, guild_id: int) -> tuple[list[int], list[int]]:
+    """Forward the source message to any group channels missing from the
+    cluster — i.e. channels whose original webhook.send() failed and were
+    silently dropped (see _translate_and_send / _raw_forward_send). Returns
+    (succeeded_channel_ids, failed_channel_ids).
+
+    Always re-translates via _translate_and_send, even if the original send
+    used the \\-raw-forward prefix — the cluster doesn't persist which mode
+    produced it, and translating on retry is the safer default.
+    """
+    source_ch_id = cluster["source_ch"]
+    group_channels = _guild_channels_for(source_ch_id)
+    missing = [
+        ch_id for ch_id, info in group_channels.items()
+        if ch_id != source_ch_id
+        and info.get("webhook_url")
+        and ch_id not in cluster["channels"]
+    ]
+    if not missing:
+        return [], []
+
+    source_text = cluster["contents"].get(source_ch_id, "")
+    source_lang = cluster["source_lang"]
+    username = cluster.get("author", "")
+    avatar_url = cluster.get("avatar_url", "")
+    attachments = [
+        _ClusterAttachment(url, name)
+        for url, name in zip(
+            cluster.get("att_urls", {}).get(source_ch_id, []),
+            cluster.get("att_names", {}).get(source_ch_id, []),
+        )
+    ]
+    guild_glossary = get_guild_glossary(guild_id, _glossary_data)
+    guild_substitutions = get_guild_substitutions(guild_id, _substitutions_data)
+
+    # Thread routing mirrors on_message: the source's own thread id (if any)
+    # looks up the matching per-channel thread ids via the same registry.
+    source_thread_id = cluster.get("thread_channels", {}).get(source_ch_id)
+    thread_map = _thread_clusters.get(source_thread_id) if source_thread_id else None
+
+    async def _retry_one(ch_id: int):
+        info = group_channels[ch_id]
+        target_thread_id = thread_map.get(ch_id) if thread_map else None
+        if thread_map is not None and target_thread_id is None:
+            return ch_id, None
+        # quoted_content/quoted_author are deliberately not passed here:
+        # cluster["prefixes"][ch_id] already holds a fully "> "-formatted
+        # reply-quote block, but _translate_and_send expects the *raw* quote
+        # text and applies its own "> " prefixing — passing the pre-formatted
+        # block through would double-quote it (e.g. "> > **name**: ..."). The
+        # tradeoff: a backfilled message loses its reply-quote header if the
+        # original had one; the alternative (visibly broken quoting) is worse.
+        result = await _translate_and_send(
+            source_text, source_lang, info["lang"],
+            info["webhook_url"], username, avatar_url,
+            attachments, [],  # stickers aren't persisted on the cluster
+            None, None,
+            guild_glossary, guild_substitutions, target_thread_id, None,
+        )
+        return ch_id, result
+
+    pairs = await asyncio.gather(*[_retry_one(ch_id) for ch_id in missing])
+
+    succeeded, failed = [], []
+    for ch_id, result in pairs:
+        if result is None:
+            failed.append(ch_id)
+            continue
+        sent_id, sent_text = result
+        cluster["channels"][ch_id] = sent_id
+        cluster["contents"][ch_id] = sent_text or ""
+        cluster["att_names"][ch_id] = cluster.get("att_names", {}).get(source_ch_id, [])
+        cluster["att_urls"][ch_id] = cluster.get("att_urls", {}).get(source_ch_id, [])
+        if thread_map is not None:
+            tid = thread_map.get(ch_id)
+            if tid is not None:
+                cluster.setdefault("thread_channels", {})[ch_id] = tid
+        succeeded.append(ch_id)
+
+    if succeeded:
+        _store_cluster(cluster)
+        log_event(f"[forward-retry] backfilled channels {succeeded} for source msg in ch={source_ch_id}")
+    if failed:
+        log_event(f"[forward-retry] still failed for channels {failed} for source msg in ch={source_ch_id}")
+
+    return succeeded, failed
 
 
 async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_id: int) -> str | None:
@@ -976,6 +1094,11 @@ async def _handle_feedback(payload: discord.RawReactionActionEvent, cluster: dic
             break
     if guild_id is None:
         return
+
+    # Whatever copy the user reacted on, also retry any channels the cluster
+    # never reached in the first place — the cluster is shared, so this
+    # backfill applies regardless of which channel triggered the reaction.
+    await _retry_missing_channels(cluster, guild_id)
 
     msg_id = cluster["channels"].get(parent_ch_id)
     if not msg_id:
@@ -1328,6 +1451,18 @@ async def retranslate_context_menu(interaction: discord.Interaction, message: di
         )
         return
 
+    guild_id = interaction.guild_id
+    if guild_id is None:
+        await interaction.followup.send(
+            await _ui_msg(uid, "找不到對應的伺服器設定。"), ephemeral=True
+        )
+        return
+
+    # Whatever copy this was used on, also retry any channels the cluster
+    # never reached in the first place (e.g. a channel whose webhook.send()
+    # failed on the original forward) — the cluster is shared across copies.
+    backfilled, still_missing = await _retry_missing_channels(cluster, guild_id)
+
     # Find parent_ch_id for this message in the cluster
     parent_ch_id: int | None = None
     for pid, mid in cluster["channels"].items():
@@ -1341,25 +1476,22 @@ async def retranslate_context_menu(interaction: discord.Interaction, message: di
         return
 
     if parent_ch_id == cluster["source_ch"]:
-        await interaction.followup.send(
-            await _ui_msg(uid, "此訊息是原文，無法重新翻譯。"), ephemeral=True
-        )
-        return
-
-    guild_id: int | None = None
-    for guild in bot.guilds:
-        if parent_ch_id in channel_configs.get(guild.id, {}):
-            guild_id = guild.id
-            break
-    if guild_id is None:
-        await interaction.followup.send(
-            await _ui_msg(uid, "找不到對應的伺服器設定。"), ephemeral=True
-        )
+        if backfilled:
+            names = "、".join(f"<#{c}>" for c in backfilled)
+            await interaction.followup.send(f"已補發到：{names}", ephemeral=True)
+        elif still_missing:
+            names = "、".join(f"<#{c}>" for c in still_missing)
+            await interaction.followup.send(f"補發失敗：{names}", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                await _ui_msg(uid, "此訊息是原文，無法重新翻譯。"), ephemeral=True
+            )
         return
 
     translated = await _do_retranslate(parent_ch_id, message.id, cluster, guild_id)
     if translated:
-        await interaction.followup.send(await _ui_msg(uid, "已重新翻譯。"), ephemeral=True)
+        note = f"（另補發到：{'、'.join(f'<#{c}>' for c in backfilled)}）" if backfilled else ""
+        await interaction.followup.send(await _ui_msg(uid, "已重新翻譯。") + note, ephemeral=True)
     else:
         await interaction.followup.send(
             await _ui_msg(uid, "重新翻譯失敗，或翻譯結果與原文相同。"), ephemeral=True
