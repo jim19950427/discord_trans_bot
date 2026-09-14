@@ -330,6 +330,41 @@ def test_three_azure_failures_open_circuit_and_fourth_call_skips_azure():
     assert any(fields.get("fallback_reason") == "circuit_open" for _, fields in logs)
 
 
+def test_stale_azure_success_does_not_close_open_circuit():
+    first_started = threading.Event()
+    release_first = threading.Event()
+    calls_lock = threading.Lock()
+    calls = 0
+
+    def post(url, **kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_started.set()
+            assert release_first.wait(timeout=2)
+            return FakeResponse(payload=[{"translations": [{"text": "first"}]}])
+        return FakeResponse(status_code=500)
+
+    chain = TranslationProviderChain(
+        make_settings(provider_order=("azure",)), post=post
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(chain.translate, "first", "en", "fr")
+        assert first_started.wait(timeout=2)
+        assert [chain.translate(f"failure {i}", "en", "fr") for i in range(3)] == [
+            None,
+            None,
+            None,
+        ]
+        release_first.set()
+        assert first.result(timeout=2) == "first"
+
+    assert chain.translate("during cooldown", "en", "fr") is None
+    assert calls == 4
+
+
 def test_libretranslate_concurrency_is_capped_at_two():
     active = 0
     maximum = 0

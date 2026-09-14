@@ -112,6 +112,7 @@ class CircuitBreaker:
         self._failures = 0
         self._open_until = 0.0
         self._probe_in_flight = False
+        self._generation = 0
 
     @property
     def state(self) -> str:
@@ -123,31 +124,40 @@ class CircuitBreaker:
             return "closed"
 
     def allow_request(self) -> tuple[bool, str]:
+        allowed, state, _ = self.admit_request()
+        return allowed, state
+
+    def admit_request(self) -> tuple[bool, str, int | None]:
         with self._lock:
             now = self._monotonic()
             if self._open_until <= 0:
-                return True, "closed"
+                return True, "closed", self._generation
             if now < self._open_until:
-                return False, "open"
+                return False, "open", None
             if self._probe_in_flight:
-                return False, "half_open"
+                return False, "half_open", None
             self._probe_in_flight = True
-            return True, "half_open"
+            return True, "half_open", self._generation
 
-    def record_success(self) -> str | None:
+    def record_success(self, generation: int | None = None) -> str | None:
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return None
             changed = self._failures > 0 or self._open_until > 0 or self._probe_in_flight
             self._failures = 0
             self._open_until = 0.0
             self._probe_in_flight = False
             return "closed" if changed else None
 
-    def record_failure(self) -> str | None:
+    def record_failure(self, generation: int | None = None) -> str | None:
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return None
             self._failures += 1
             if self._probe_in_flight or self._failures >= self.failure_threshold:
                 self._open_until = self._monotonic() + self.cooldown
                 self._probe_in_flight = False
+                self._generation += 1
                 return "opened"
             return None
 
@@ -280,7 +290,7 @@ class TranslationProviderChain:
                 if not self.settings.azure_key:
                     self._log_missing_key_once(source, target)
                     continue
-                allowed, state = self._circuit.allow_request()
+                allowed, state, generation = self._circuit.admit_request()
                 if not allowed:
                     self._emit(
                         "azure",
@@ -296,7 +306,7 @@ class TranslationProviderChain:
                 try:
                     result = self._azure_translate(text, source, target)
                 except ProviderError as error:
-                    transition = self._circuit.record_failure()
+                    transition = self._circuit.record_failure(generation)
                     self._emit(
                         "azure",
                         source,
@@ -308,7 +318,7 @@ class TranslationProviderChain:
                         circuit_state=transition or self._circuit.state,
                     )
                     continue
-                transition = self._circuit.record_success()
+                transition = self._circuit.record_success(generation)
                 self._emit(
                     "azure",
                     source,
