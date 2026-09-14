@@ -4,42 +4,11 @@ import json
 import time
 import threading
 import diskcache
-import deep_translator.google as _deep_google
-from deep_translator import GoogleTranslator
-
-# ── Google Translate scraper hardening ────────────────────────────────────
-# deep-translator calls requests.get() without a User-Agent, so requests sends
-# "python-requests/x.y". Google began blocking that UA in Aug 2026: it answers
-# HTTP 200 (so deep-translator's status-code check passes) but puts its own
-# "Error 500 (Server Error)" page in the result slot instead of a translation.
-# A browser UA gets normal results from the very same endpoint.
-_BROWSER_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+from translation_providers import (
+    ProviderSettings,
+    TranslationProviderChain,
+    canonicalize_language,
 )
-
-
-class _UARequestsProxy:
-    """Wraps the requests module so every GET carries a browser User-Agent.
-
-    deep-translator exposes no hook for request headers, so the only place to
-    inject one is the `requests` reference inside its google module.
-    """
-
-    def __init__(self, real):
-        self._real = real
-
-    def get(self, *args, **kwargs):
-        headers = dict(kwargs.pop("headers", None) or {})
-        headers.setdefault("User-Agent", _BROWSER_UA)
-        return self._real.get(*args, headers=headers, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._real, name)
-
-
-if not isinstance(_deep_google.requests, _UARequestsProxy):
-    _deep_google.requests = _UARequestsProxy(_deep_google.requests)
 
 CACHE_DIR = os.getenv("TRANSLATE_CACHE_DIR", "/data/translate_cache")
 CACHE_SIZE_LIMIT = int(os.getenv("TRANSLATE_CACHE_SIZE_LIMIT", str(50 * 1024 * 1024)))
@@ -49,6 +18,8 @@ LOG_MAX_ENTRIES = int(os.getenv("BOT_LOG_MAX_ENTRIES", "5000"))
 _log_lock = threading.Lock()
 
 _translate_cache: diskcache.Cache | None = None
+_provider_chain: TranslationProviderChain | None = None
+_provider_chain_lock = threading.Lock()
 
 
 def _get_translate_cache() -> diskcache.Cache:
@@ -61,12 +32,6 @@ def _get_translate_cache() -> diskcache.Cache:
             eviction_policy="least-recently-used",
         )
     return _translate_cache
-
-# Build a lowercase-keyed lookup so user input like "zh-tw" maps to "zh-TW"
-_SUPPORTED: dict[str, str] = {
-    v.lower(): v
-    for v in GoogleTranslator().get_supported_languages(as_dict=True).values()
-}
 
 # Discord custom emoji: <:name:id> or animated <a:name:id>
 _CUSTOM_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
@@ -83,7 +48,7 @@ _UNICODE_EMOJI_RE = re.compile(
     "]+",
     re.UNICODE,
 )
-# URLs — Google Translate returns them unchanged, causing pointless retries
+# URLs are preserved verbatim rather than sent to the translation provider.
 _URL_RE = re.compile(r"https?://\S+")
 # Matches any real word character (letters/digits from any script, incl. CJK)
 _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
@@ -92,31 +57,8 @@ _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
 # artifacts (e.g. \x1d Group Separator) from other apps. Left in place,
 # they fragment a message into spurious per-word "lines" during translation.
 _STRAY_LINEBREAK_RE = re.compile("[\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
-# Google's /m endpoint answers HTTP 200 even when it fails, embedding its own
-# error page in the result slot — so deep-translator returns that page's text
-# as if it were a translation. It doesn't equal the input, so the plain
-# result!=input check accepts it, and _cached_translate then stores the garbage
-# permanently. These markers are Google's error-page signature: a "Error NNN
-# (Server Error)" banner and the "That's all we know." footer. Both are far too
-# distinctive to collide with real chat text, and _looks_like_error_page still
-# refuses to fire when the source text already contained the marker itself.
-_ERROR_PAGE_RE = re.compile(
-    r"error \d{3} \(server error\)|that['\u2019]s all we know",
-    re.IGNORECASE,
-)
-
-
-def _looks_like_error_page(result: str, source_text: str) -> bool:
-    """True if `result` is Google's error page rather than a translation."""
-    if not _ERROR_PAGE_RE.search(result):
-        return False
-    # Don't misfire on a message that genuinely contains the phrase.
-    return not _ERROR_PAGE_RE.search(source_text)
-
-
-
 def normalize_lang(code: str) -> str:
-    return _SUPPORTED.get(code.lower(), code)
+    return canonicalize_language(code)
 
 
 def has_translatable_content(text: str) -> bool:
@@ -164,95 +106,28 @@ def log_event(message: str, **fields) -> None:
             print(f"[log write failed] {e}")
 
 
+def _get_provider_chain() -> TranslationProviderChain:
+    global _provider_chain
+    if _provider_chain is None:
+        with _provider_chain_lock:
+            if _provider_chain is None:
+                _provider_chain = TranslationProviderChain(
+                    ProviderSettings.from_env(), logger=log_event
+                )
+    return _provider_chain
+
+
 def _log_translate_event(src: str, dest: str, text: str, result: str | None) -> None:
     message = f"[translate] ({src}->{dest}) {repr(text)} -> {repr(result)}"
     log_event(message, type="translate", src=src, dest=dest, input=text, output=result)
 
 
-def _try_google(text: str, source: str, target: str, retries: int = 4) -> str | None:
-    """Call Google Translate with retries for rate limits and no-result
-    errors (exponential backoff, up to `retries` attempts).
-
-    A result that equals the input isn't a transient failure — it means
-    this content just has no different translation (timestamps, leftover
-    glossary placeholders, decoratively-spaced text, etc.), so retrying
-    with the full exponential backoff only wastes time. That case gets its
-    own much smaller retry budget instead.
-    """
-    SAME_INPUT_RETRIES = 2
-    SAME_INPUT_WAIT = 1
-    # An error page means Google itself is failing, not that we were throttled.
-    # When it happens it tends to be persistent (a blocked client, a broken
-    # endpoint), so probing briefly and then degrading to untranslated text
-    # beats stalling every language of every message on the full backoff.
-    ERROR_PAGE_RETRIES = 2
-    ERROR_PAGE_WAIT = 1
-    same_input_attempts = 0
-    error_page_attempts = 0
-    for attempt in range(retries):
-        try:
-            result = GoogleTranslator(source=source, target=target).translate(text)
-            if result and _looks_like_error_page(result, text):
-                # Never return or cache this — it would be posted to Discord as
-                # if it were the translation.
-                error_page_attempts += 1
-                log_event(
-                    f"[translate] error page from Google ({source}->{target}) "
-                    f"attempt {error_page_attempts}: {result[:80]!r}"
-                )
-                if error_page_attempts < ERROR_PAGE_RETRIES:
-                    time.sleep(ERROR_PAGE_WAIT)
-                    continue
-                break
-            if result and result.strip() != text.strip():
-                return result
-            # Result equals input — Google returned original text unchanged.
-            same_input_attempts += 1
-            if same_input_attempts < SAME_INPUT_RETRIES:
-                log_event(f"[translate] result==input ({source}->{target}) attempt {same_input_attempts}, retrying in {SAME_INPUT_WAIT}s")
-                time.sleep(SAME_INPUT_WAIT)
-            else:
-                break
-        except Exception as e:
-            err = str(e).lower()
-            retryable = any(k in err for k in (
-                "429", "too many", "rate limit", "quota", "no translation was found"
-            ))
-            if retryable:
-                if attempt < retries - 1:
-                    wait = 2 ** attempt
-                    log_event(f"[translate] retryable error ({source}->{target}) attempt {attempt+1}: {e}, retrying in {wait}s")
-                    time.sleep(wait)
-                continue
-            log_event(f"Google Translate error (source={source}, target={target}): {e}")
-            break
-    return None
-
-
-def _source_variants(src: str) -> list[str]:
-    """Return source codes to try in order. CJK sources get extra fallbacks.
-
-    Note: bare "zh" is deliberately not included — deep_translator's
-    GoogleTranslator only supports "zh-CN"/"zh-TW", and "zh" always raises
-    "No support for the provided language", wasting an API call every time.
-    """
-    lower = src.lower()
-    if lower == "zh-tw":
-        return [src, "zh-CN", "auto"]
-    if lower == "zh-cn":
-        return [src, "auto"]
-    return [src, "auto"]
-
-
 def _translate_with_fallback(text: str, src: str, dest: str) -> str | None:
-    """Try source variants in order until one returns a translation."""
-    for source in _source_variants(src):
-        result = _try_google(text, source, dest)
-        if result:
-            _log_translate_event(src, dest, text, result)
-            return result
-    _log_translate_event(src, dest, text, None)
-    return None
+    src = normalize_lang(src)
+    dest = normalize_lang(dest)
+    result = _get_provider_chain().translate(text, src, dest)
+    _log_translate_event(src, dest, text, result)
+    return result
 
 
 def _cached_translate(text: str, src: str, dest: str, cache: diskcache.Cache | None = None) -> str | None:
@@ -348,7 +223,7 @@ def translate_text(
         for src_term, replacement in substitutions.items():
             text = re.sub(re.escape(src_term), replacement, text, flags=re.IGNORECASE)
 
-    # Pull out custom Discord emojis — Google Translate chokes on <:name:id> syntax
+    # Pull out custom Discord emojis so translation providers never see their syntax.
     emojis = _CUSTOM_EMOJI_RE.findall(text)
     clean = _CUSTOM_EMOJI_RE.sub("", text).strip()
 
@@ -359,9 +234,8 @@ def translate_text(
     if not _HAS_WORD_RE.search(clean):
         return _with_mentions(text)
 
-    # Split by newlines and translate each line independently to avoid a
-    # deep-translator / unofficial Google API bug where only the first line
-    # gets translated when the input contains newlines.
+    # Split by newlines and translate each line independently when special
+    # handling is needed for part of the message.
     # Use split("\n") rather than splitlines() — splitlines() also breaks on
     # \v, \f, \x1c-\x1e, \x85, U+2028/U+2029, none of which Discord renders
     # as a line break, so treating them as one would fragment the message.
@@ -404,9 +278,9 @@ def translate_text(
     # all sentence context when each line is translated independently —
     # e.g. "打破" alone becomes "break in" instead of "break". If no line
     # needs special handling (a real glossary match, or a Unicode emoji/URL
-    # mixed in with real words), translate the whole block in one call so
-    # Google keeps cross-line context. A trailing emoji-only line (very
-    # common) doesn't block this — Google passes it through unchanged either way.
+    # mixed in with real words), translate the whole block in one call so the
+    # provider keeps cross-line context. A trailing emoji-only line (very
+    # common) doesn't block this — it is preserved unchanged either way.
     if (
         len(lines) > 1
         and not any(_line_needs_extraction(line) or _line_matches_glossary(line) for line in lines)

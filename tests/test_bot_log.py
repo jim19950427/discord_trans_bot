@@ -1,4 +1,5 @@
 import json
+from unittest.mock import Mock
 
 import translator
 
@@ -34,7 +35,9 @@ def test_log_event_accepts_extra_fields(tmp_path, monkeypatch):
 def test_log_event_and_translate_event_share_the_same_file(tmp_path, monkeypatch):
     log_file = tmp_path / "bot_log.json"
     monkeypatch.setattr(translator, "LOG_FILE", str(log_file))
-    monkeypatch.setattr(translator, "_try_google", lambda t, s, d: "你好")
+    chain = Mock()
+    chain.translate.return_value = "你好"
+    monkeypatch.setattr(translator, "_get_provider_chain", lambda: chain)
 
     translator.log_event("bot started")
     translator._translate_with_fallback("hello", "en", "zh-TW")
