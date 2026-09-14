@@ -200,12 +200,16 @@ class TranslationProviderChain:
         settings: ProviderSettings,
         *,
         post: Callable[..., Any] = requests.post,
+        get: Callable[..., Any] = requests.get,
         monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         logger: Callable[..., None] | None = None,
     ):
         self.settings = settings
         self._post = post
+        self._get = get
         self._monotonic = monotonic
+        self._wall_clock = wall_clock
         self._logger = logger
         self._circuit = CircuitBreaker(
             settings.circuit_failure_threshold,
@@ -217,6 +221,106 @@ class TranslationProviderChain:
         )
         self._diagnostic_lock = threading.Lock()
         self._missing_key_logged = False
+        self._health_lock = threading.Lock()
+        self._health = {
+            provider: {
+                "last_attempt_at": None,
+                "last_success_at": None,
+                "last_failure_at": None,
+                "last_latency_ms": None,
+                "last_failure_reason": None,
+                "last_target_count": None,
+            }
+            for provider in SUPPORTED_PROVIDERS
+        }
+        self._fallback = {"last_at": None, "reason": None}
+
+    @staticmethod
+    def _bounded_reason(reason: str) -> str:
+        return reason[:160]
+
+    def _record_provider_attempt(
+        self,
+        provider: str,
+        *,
+        success: bool,
+        latency_ms: int,
+        target_count: int,
+        failure_reason: str | None = None,
+    ) -> None:
+        now = self._wall_clock()
+        with self._health_lock:
+            state = self._health[provider]
+            state["last_attempt_at"] = now
+            state["last_latency_ms"] = latency_ms
+            state["last_target_count"] = target_count
+            if success:
+                state["last_success_at"] = now
+            else:
+                state["last_failure_at"] = now
+                state["last_failure_reason"] = self._bounded_reason(
+                    failure_reason or "request_error"
+                )
+
+    def _record_fallback(self, reason: str) -> None:
+        with self._health_lock:
+            self._fallback = {
+                "last_at": self._wall_clock(),
+                "reason": self._bounded_reason(reason),
+            }
+
+    def status_snapshot(self) -> dict[str, dict[str, Any]]:
+        with self._health_lock:
+            snapshot = {
+                provider: dict(state) for provider, state in self._health.items()
+            }
+            fallback = dict(self._fallback)
+        snapshot["azure"]["configured"] = bool(self.settings.azure_key)
+        snapshot["azure"]["circuit_state"] = self._circuit.state
+        snapshot["fallback"] = fallback
+        return snapshot
+
+    def probe_libretranslate(self, timeout: float = 5.0) -> dict[str, Any]:
+        started = self._monotonic()
+        try:
+            response = self._get(
+                f"{self.settings.libretranslate_url}/languages", timeout=timeout
+            )
+            if not 200 <= response.status_code < 300:
+                raise ProviderError(f"http_{response.status_code}")
+            try:
+                payload = response.json()
+            except (TypeError, ValueError) as exc:
+                raise ProviderError("invalid_json", type(exc).__name__) from exc
+            if not isinstance(payload, list):
+                raise ProviderError("invalid_response")
+            languages = sorted(
+                entry["code"]
+                for entry in payload
+                if isinstance(entry, dict) and isinstance(entry.get("code"), str)
+            )
+            if not languages:
+                raise ProviderError("invalid_response")
+        except ProviderError as error:
+            return {
+                "healthy": False,
+                "languages": [],
+                "latency_ms": int((self._monotonic() - started) * 1000),
+                "failure_reason": self._bounded_reason(error.category),
+            }
+        except Exception:
+            return {
+                "healthy": False,
+                "languages": [],
+                "latency_ms": int((self._monotonic() - started) * 1000),
+                "failure_reason": "request_error",
+            }
+        return {
+            "healthy": True,
+            "languages": languages,
+            "latency_ms": int((self._monotonic() - started) * 1000),
+            "failure_reason": None,
+        }
 
     def _emit(self, provider: str, source: str, target: str, **fields) -> None:
         if self._logger:
@@ -333,9 +437,11 @@ class TranslationProviderChain:
             if provider == "azure":
                 if not self.settings.azure_key:
                     self._log_missing_key_once(source, unresolved[0])
+                    self._record_fallback("missing_key")
                     continue
                 allowed, state, generation = self._circuit.admit_request()
                 if not allowed:
+                    self._record_fallback("circuit_open")
                     self._emit(
                         "azure",
                         source,
@@ -350,25 +456,41 @@ class TranslationProviderChain:
                 try:
                     azure_results = self._azure_translate_many(text, source, unresolved)
                 except ProviderError as error:
+                    latency_ms = int((self._monotonic() - started) * 1000)
                     transition = self._circuit.record_failure(generation)
+                    self._record_provider_attempt(
+                        "azure",
+                        success=False,
+                        latency_ms=latency_ms,
+                        target_count=len(unresolved),
+                        failure_reason=error.category,
+                    )
+                    self._record_fallback(error.category)
                     self._emit(
                         "azure",
                         source,
                         ",".join(unresolved),
                         success=False,
-                        latency_ms=int((self._monotonic() - started) * 1000),
+                        latency_ms=latency_ms,
                         fallback_reason=error.category,
                         error_detail=error.detail or None,
                         circuit_state=transition or self._circuit.state,
                     )
                     continue
                 transition = self._circuit.record_success(generation)
+                latency_ms = int((self._monotonic() - started) * 1000)
+                self._record_provider_attempt(
+                    "azure",
+                    success=True,
+                    latency_ms=latency_ms,
+                    target_count=len(unresolved),
+                )
                 self._emit(
                     "azure",
                     source,
                     ",".join(unresolved),
                     success=True,
-                    latency_ms=int((self._monotonic() - started) * 1000),
+                    latency_ms=latency_ms,
                     fallback_reason=None,
                     circuit_state=transition or self._circuit.state,
                 )
@@ -382,23 +504,39 @@ class TranslationProviderChain:
                     try:
                         result = self._libretranslate_translate(text, source, target)
                     except ProviderError as error:
+                        latency_ms = int((self._monotonic() - started) * 1000)
+                        self._record_provider_attempt(
+                            "libretranslate",
+                            success=False,
+                            latency_ms=latency_ms,
+                            target_count=1,
+                            failure_reason=error.category,
+                        )
+                        self._record_fallback(error.category)
                         self._emit(
                             "libretranslate",
                             source,
                             target,
                             success=False,
-                            latency_ms=int((self._monotonic() - started) * 1000),
+                            latency_ms=latency_ms,
                             fallback_reason=error.category,
                             error_detail=error.detail or None,
                             circuit_state=self._circuit.state,
                         )
                         continue
+                    latency_ms = int((self._monotonic() - started) * 1000)
+                    self._record_provider_attempt(
+                        "libretranslate",
+                        success=True,
+                        latency_ms=latency_ms,
+                        target_count=1,
+                    )
                     self._emit(
                         "libretranslate",
                         source,
                         target,
                         success=True,
-                        latency_ms=int((self._monotonic() - started) * 1000),
+                        latency_ms=latency_ms,
                         fallback_reason=None,
                         circuit_state=self._circuit.state,
                     )

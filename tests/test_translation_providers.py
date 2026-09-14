@@ -469,3 +469,93 @@ def test_libretranslate_concurrency_is_capped_at_two():
         assert [future.result(timeout=2) for future in futures] == ["ok"] * 6
 
     assert maximum == 2
+
+
+def test_status_snapshot_is_sanitized_and_batch_aware():
+    post = Mock(return_value=FakeResponse(payload=[{"translations": [
+        {"text": "bonjour", "to": "fr"}, {"text": "\u3053\u3093\u306b\u3061\u306f", "to": "ja"},
+    ]}]))
+    chain = TranslationProviderChain(
+        make_settings(), post=post, wall_clock=lambda: 1234.0
+    )
+
+    chain.translate_many("private phrase", "auto", ["fr", "ja"])
+
+    status = chain.status_snapshot()
+    assert status["azure"]["last_success_at"] == 1234.0
+    assert status["azure"]["last_target_count"] == 2
+    assert status["azure"]["circuit_state"] == "closed"
+    assert status["azure"]["configured"] is True
+    assert "private phrase" not in repr(status)
+    assert "test-key" not in repr(status)
+
+
+def test_status_snapshot_records_bounded_fallback_failure_without_request_content():
+    chain = TranslationProviderChain(
+        make_settings(provider_order=("azure",)),
+        post=Mock(return_value=FakeResponse(status_code=503)),
+        wall_clock=lambda: 2345.0,
+    )
+
+    assert chain.translate("private phrase", "en", "fr") is None
+
+    status = chain.status_snapshot()
+    assert status["azure"]["last_attempt_at"] == 2345.0
+    assert status["azure"]["last_failure_at"] == 2345.0
+    assert status["azure"]["last_failure_reason"] == "http_503"
+    assert status["fallback"] == {"last_at": 2345.0, "reason": "http_503"}
+    assert "private phrase" not in repr(status)
+    assert "test-key" not in repr(status)
+
+
+def test_probe_libretranslate_reports_sorted_languages_and_latency():
+    get = Mock(return_value=FakeResponse(payload=[
+        {"code": "ko"}, {"code": "zt"}, {"code": "en"}, {"code": "ja"},
+    ]))
+    elapsed = iter([10.0, 10.125])
+    chain = TranslationProviderChain(
+        make_settings(), get=get, monotonic=lambda: next(elapsed)
+    )
+
+    probe = chain.probe_libretranslate()
+
+    assert get.call_args.args[0] == "http://libretranslate:5000/languages"
+    assert get.call_args.kwargs["timeout"] == 5.0
+    assert probe == {
+        "healthy": True,
+        "languages": ["en", "ja", "ko", "zt"],
+        "latency_ms": 125,
+        "failure_reason": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_reason"),
+    [
+        (FakeResponse(status_code=503), "http_503"),
+        (FakeResponse(payload={}), "invalid_response"),
+    ],
+)
+def test_probe_libretranslate_reports_unhealthy_http_and_invalid_payload(response, expected_reason):
+    chain = TranslationProviderChain(make_settings(), get=Mock(return_value=response))
+
+    probe = chain.probe_libretranslate()
+
+    assert probe["healthy"] is False
+    assert probe["languages"] == []
+    assert probe["failure_reason"] == expected_reason
+    assert probe["latency_ms"] >= 0
+
+
+def test_probe_libretranslate_reports_timeout_without_mutating_passive_health():
+    chain = TranslationProviderChain(
+        make_settings(), get=Mock(side_effect=TimeoutError("private phrase"))
+    )
+    before = chain.status_snapshot()
+
+    probe = chain.probe_libretranslate(timeout=1.5)
+
+    assert probe["healthy"] is False
+    assert probe["languages"] == []
+    assert probe["failure_reason"] == "request_error"
+    assert chain.status_snapshot() == before
