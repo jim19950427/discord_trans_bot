@@ -3,9 +3,12 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 import warnings
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
+
+import requests
 
 
 SUPPORTED_PROVIDERS = ("azure", "libretranslate")
@@ -147,3 +150,200 @@ class CircuitBreaker:
                 self._probe_in_flight = False
                 return "opened"
             return None
+
+
+class ProviderError(RuntimeError):
+    def __init__(self, category: str, detail: str = ""):
+        super().__init__(category)
+        self.category = category
+        self.detail = detail[:160]
+
+
+def _response_text(payload: Any, provider: str) -> str:
+    try:
+        if provider == "azure":
+            text = payload[0]["translations"][0]["text"]
+        else:
+            text = payload["translatedText"]
+    except (IndexError, KeyError, TypeError) as exc:
+        raise ProviderError("invalid_response", type(exc).__name__) from exc
+    if not isinstance(text, str) or not text.strip():
+        raise ProviderError("empty_response")
+    return text
+
+
+class TranslationProviderChain:
+    def __init__(
+        self,
+        settings: ProviderSettings,
+        *,
+        post: Callable[..., Any] = requests.post,
+        monotonic: Callable[[], float] = time.monotonic,
+        logger: Callable[..., None] | None = None,
+    ):
+        self.settings = settings
+        self._post = post
+        self._monotonic = monotonic
+        self._logger = logger
+        self._circuit = CircuitBreaker(
+            settings.circuit_failure_threshold,
+            settings.circuit_cooldown,
+            monotonic=monotonic,
+        )
+        self._libre_slots = threading.BoundedSemaphore(
+            settings.libretranslate_max_concurrency
+        )
+        self._diagnostic_lock = threading.Lock()
+        self._missing_key_logged = False
+
+    def _emit(self, provider: str, source: str, target: str, **fields) -> None:
+        if self._logger:
+            self._logger(
+                f"[translate_provider] {provider} {source}->{target} "
+                f"success={fields.get('success')}",
+                type="translate_provider",
+                provider=provider,
+                src=source,
+                dest=target,
+                **fields,
+            )
+
+    def _azure_translate(self, text: str, source: str, target: str) -> str:
+        params = {"api-version": "3.0", "to": map_language(target, "azure")}
+        if source.lower() != "auto":
+            params["from"] = map_language(source, "azure")
+        headers = {
+            "Ocp-Apim-Subscription-Key": self.settings.azure_key,
+            "Ocp-Apim-Subscription-Region": self.settings.azure_region,
+            "Content-Type": "application/json",
+            "X-ClientTraceId": str(uuid.uuid4()),
+        }
+        try:
+            response = self._post(
+                f"{self.settings.azure_endpoint}/translate",
+                params=params,
+                headers=headers,
+                json=[{"Text": text}],
+                timeout=self.settings.azure_timeout,
+            )
+        except Exception as exc:
+            raise ProviderError("request_error", type(exc).__name__) from exc
+        if not 200 <= response.status_code < 300:
+            raise ProviderError(f"http_{response.status_code}")
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise ProviderError("invalid_json", type(exc).__name__) from exc
+        return _response_text(payload, "azure")
+
+    def _log_missing_key_once(self, source: str, target: str) -> None:
+        with self._diagnostic_lock:
+            if self._missing_key_logged:
+                return
+            self._missing_key_logged = True
+        self._emit(
+            "azure",
+            source,
+            target,
+            success=False,
+            latency_ms=0,
+            fallback_reason="missing_key",
+            circuit_state=self._circuit.state,
+        )
+
+    def _libretranslate_translate(self, text: str, source: str, target: str) -> str:
+        try:
+            with self._libre_slots:
+                response = self._post(
+                    f"{self.settings.libretranslate_url}/translate",
+                    json={
+                        "q": text,
+                        "source": map_language(source, "libretranslate"),
+                        "target": map_language(target, "libretranslate"),
+                        "format": "text",
+                    },
+                    timeout=self.settings.libretranslate_timeout,
+                )
+        except Exception as exc:
+            raise ProviderError("request_error", type(exc).__name__) from exc
+        if not 200 <= response.status_code < 300:
+            raise ProviderError(f"http_{response.status_code}")
+        try:
+            payload = response.json()
+        except (TypeError, ValueError) as exc:
+            raise ProviderError("invalid_json", type(exc).__name__) from exc
+        return _response_text(payload, "libretranslate")
+
+    def translate(self, text: str, source: str, target: str) -> str | None:
+        for provider in self.settings.provider_order:
+            if provider == "azure":
+                if not self.settings.azure_key:
+                    self._log_missing_key_once(source, target)
+                    continue
+                allowed, state = self._circuit.allow_request()
+                if not allowed:
+                    self._emit(
+                        "azure",
+                        source,
+                        target,
+                        success=False,
+                        latency_ms=0,
+                        fallback_reason="circuit_open",
+                        circuit_state=state,
+                    )
+                    continue
+                started = self._monotonic()
+                try:
+                    result = self._azure_translate(text, source, target)
+                except ProviderError as error:
+                    transition = self._circuit.record_failure()
+                    self._emit(
+                        "azure",
+                        source,
+                        target,
+                        success=False,
+                        latency_ms=int((self._monotonic() - started) * 1000),
+                        fallback_reason=error.category,
+                        error_detail=error.detail or None,
+                        circuit_state=transition or self._circuit.state,
+                    )
+                    continue
+                transition = self._circuit.record_success()
+                self._emit(
+                    "azure",
+                    source,
+                    target,
+                    success=True,
+                    latency_ms=int((self._monotonic() - started) * 1000),
+                    fallback_reason=None,
+                    circuit_state=transition or self._circuit.state,
+                )
+                return result
+
+            if provider == "libretranslate":
+                started = self._monotonic()
+                try:
+                    result = self._libretranslate_translate(text, source, target)
+                except ProviderError as error:
+                    self._emit(
+                        "libretranslate",
+                        source,
+                        target,
+                        success=False,
+                        latency_ms=int((self._monotonic() - started) * 1000),
+                        fallback_reason=error.category,
+                        error_detail=error.detail or None,
+                        circuit_state=self._circuit.state,
+                    )
+                    continue
+                self._emit(
+                    "libretranslate",
+                    source,
+                    target,
+                    success=True,
+                    latency_ms=int((self._monotonic() - started) * 1000),
+                    fallback_reason=None,
+                    circuit_state=self._circuit.state,
+                )
+                return result
+        return None
