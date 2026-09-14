@@ -16,7 +16,7 @@ NAS="jim@192.168.1.11"
 DEST="/volume1/docker/discord-trans-bot"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-CODE_FILES=(bot.py translator.py config.py glossary.py)
+CODE_FILES=(bot.py translator.py translation_providers.py config.py glossary.py)
 DEP_FILES=(docker-compose.yml Dockerfile requirements.txt)
 
 # ── 顏色 ──────────────────────────────────────────────

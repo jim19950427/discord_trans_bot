@@ -33,7 +33,7 @@ def _watch_source_files():
     _root = os.path.dirname(os.path.abspath(__file__))
     _watched = [
         os.path.join(_root, f)
-        for f in ("bot.py", "translator.py", "config.py", "glossary.py")
+        for f in ("bot.py", "translator.py", "translation_providers.py", "config.py", "glossary.py")
     ]
     _mtimes = {f: os.path.getmtime(f) for f in _watched if os.path.exists(f)}
     while True:

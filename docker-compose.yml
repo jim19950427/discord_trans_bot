@@ -8,6 +8,7 @@ services:
       # 原始碼掛載：更新只需替換檔案後重啟容器，不需重新建置 image
       - ./bot.py:/app/bot.py:ro
       - ./translator.py:/app/translator.py:ro
+      - ./translation_providers.py:/app/translation_providers.py:ro
       - ./config.py:/app/config.py:ro
       - ./glossary.py:/app/glossary.py:ro
       # 頻道設定持久化
@@ -15,3 +16,21 @@ services:
     environment:
       - CONFIG_FILE=/data/channel_config.json
       - GLOSSARY_FILE=/data/glossary.json
+
+  libretranslate:
+    image: libretranslate/libretranslate:v1.9.6
+    restart: unless-stopped
+    environment:
+      LT_LOAD_ONLY: en,es,fr,ja,ko,pl,ru,th,zt
+      LT_THREADS: "2"
+    volumes:
+      - libretranslate_models:/home/libretranslate/.local:rw
+    healthcheck:
+      test: ["CMD-SHELL", "./venv/bin/python scripts/healthcheck.py"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 180s
+
+volumes:
+  libretranslate_models:
