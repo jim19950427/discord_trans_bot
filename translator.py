@@ -30,8 +30,22 @@ class TranslationOutcome:
 
 
 @dataclass
-class _TranslationStatus:
-    provider_succeeded: bool = True
+class _SegmentPlan:
+    original: str
+    provider_text: str | None
+    placeholder_map: dict[str, str]
+    urls: list[str]
+    unicode_emojis: list[str]
+
+
+@dataclass
+class _TargetPlan:
+    target: str
+    segments: list[_SegmentPlan]
+    separator: str
+    mentions: list[str]
+    custom_emojis: list[str]
+    terminal_none: bool = False
 
 
 def _get_translate_cache() -> diskcache.Cache:
@@ -137,7 +151,13 @@ def _log_translate_event(src: str, dest: str, text: str, result: str | None) -> 
 def _translate_with_fallback(text: str, src: str, dest: str) -> str | None:
     src = normalize_lang(src)
     dest = normalize_lang(dest)
-    result = _get_provider_chain().translate(text, src, dest)
+    chain = _get_provider_chain()
+    # The chain's scalar API already delegates to translate_many. Preserve it
+    # for legacy integrations, while also accepting batch-only chains.
+    if hasattr(chain, "translate"):
+        result = chain.translate(text, src, dest)
+    else:
+        result = chain.translate_many(text, src, [dest]).get(dest)
     _log_translate_event(src, dest, text, result)
     return result
 
@@ -152,7 +172,7 @@ def _cached_translate(text: str, src: str, dest: str, cache: diskcache.Cache | N
 
     result = _translate_with_fallback(text, src, dest)
 
-    if result is not None:
+    if result:
         cache[key] = result
     return result
 
@@ -198,19 +218,19 @@ def _restore_glossary(text: str, placeholder_map: dict[str, str]) -> str:
     return text
 
 
-def translate_text(
+def _build_target_plan(
     text: str,
     source_lang: str,
     target_lang: str,
     glossary: dict | None = None,
     substitutions: dict | None = None,
-    _use_cache: bool = True,
-    _status: _TranslationStatus | None = None,
-) -> str | None:
+) -> _TargetPlan:
     src = normalize_lang(source_lang)
     dest = normalize_lang(target_lang)
+    plan = _TargetPlan(dest, [], "\n", [], [])
     if src == dest:
-        return None
+        plan.terminal_none = True
+        return plan
 
     # Normalize real line breaks, then strip stray control characters that
     # str.splitlines() would otherwise treat as line boundaries (see
@@ -224,19 +244,7 @@ def translate_text(
     # _MENTION_RE comment for why).
     mentions = _MENTION_RE.findall(text)
     text = _MENTION_RE.sub("", text).strip()
-
-    def _with_mentions(body: str) -> str:
-        if not mentions:
-            return body
-        parts = [p for p in (body, " ".join(mentions)) if p]
-        return "  ".join(parts)
-
-    def _run_provider(segment: str, *, use_cache: bool) -> str | None:
-        operation = _cached_translate if use_cache else _translate_with_fallback
-        translated = operation(segment, src, dest)
-        if not translated and _status is not None:
-            _status.provider_succeeded = False
-        return translated
+    plan.mentions = mentions
 
     # Apply pre-translation substitutions (e.g. aliases / euphemisms)
     if substitutions:
@@ -248,11 +256,16 @@ def translate_text(
     clean = _CUSTOM_EMOJI_RE.sub("", text).strip()
 
     if not clean:
-        return _with_mentions(text) if (emojis or mentions) else None
+        plan.terminal_none = not (emojis or mentions)
+        plan.segments.append(_SegmentPlan(text, None, {}, [], []))
+        return plan
 
     # Unicode emoji only (👀) — forward verbatim, translation would mangle them
     if not _HAS_WORD_RE.search(clean):
-        return _with_mentions(text)
+        plan.segments.append(_SegmentPlan(text, None, {}, [], []))
+        return plan
+
+    plan.custom_emojis = emojis
 
     # Split by newlines and translate each line independently when special
     # handling is needed for part of the message.
@@ -305,19 +318,13 @@ def translate_text(
         len(lines) > 1
         and not any(_line_needs_extraction(line) or _line_matches_glossary(line) for line in lines)
     ):
-        block_result = _run_provider(clean, use_cache=_use_cache)
-        if not block_result:
-            log_event(f"[translate] all attempts failed ({src}->{dest}): {repr(clean)}")
-            block_result = clean
-        if emojis:
-            block_result = block_result + "  " + " ".join(emojis)
-        return _with_mentions(block_result)
+        plan.segments.append(_SegmentPlan(clean, clean, {}, [], []))
+        return plan
 
-    translated_lines: list[str] = []
     for line in lines:
         line_stripped = line.strip()
         if not line_stripped or not _HAS_WORD_RE.search(line_stripped):
-            translated_lines.append(line)
+            plan.segments.append(_SegmentPlan(line, None, {}, [], []))
             continue
 
         # Strip Unicode emojis and URLs — both confuse/stall the translation API
@@ -325,48 +332,138 @@ def translate_text(
         line_urls = _URL_RE.findall(line_stripped)
         segment = _URL_RE.sub("", _UNICODE_EMOJI_RE.sub("", line_stripped)).strip()
         if not segment or not _HAS_WORD_RE.search(segment):
-            translated_lines.append(line_stripped)
+            plan.segments.append(_SegmentPlan(line_stripped, None, {}, [], []))
             continue
 
         placeholder_map: dict[str, str] = {}
         if glossary:
             segment, placeholder_map = _apply_glossary(segment, dest, glossary)
 
-        if placeholder_map:
-            # If the entire line is covered by glossary placeholders, skip
-            # translation and restore directly — glossary takes priority.
-            remainder = re.sub(r"§\d+§", "", segment).strip()
-            if not remainder:
-                line_result = _restore_glossary(segment, placeholder_map)
+        # Full glossary matches need no provider. Partial matches retain the
+        # raw placeholders for grouping/cache and restore per target later.
+        provider_text = segment
+        original = line_stripped
+        if placeholder_map and not re.sub(r"§\d+§", "", segment).strip():
+            provider_text = None
+            restored = _restore_glossary(segment, placeholder_map)
+            if restored:
+                original = restored
             else:
-                line_result = _run_provider(segment, use_cache=False)
-                if line_result:
-                    line_result = _restore_glossary(line_result, placeholder_map)
-                else:
-                    line_result = _restore_glossary(segment, placeholder_map)
+                # Empty glossary values historically fall back to the line,
+                # with its URL/emoji placement preserved.
+                line_urls = []
+                line_emojis = []
+        plan.segments.append(
+            _SegmentPlan(original, provider_text, placeholder_map, line_urls, line_emojis)
+        )
+
+    return plan
+
+
+def _render_target_plan(
+    plan: _TargetPlan, segment_results: dict[int, str | None]
+) -> TranslationOutcome:
+    if plan.terminal_none:
+        return TranslationOutcome(None, True)
+
+    succeeded = True
+    rendered = []
+    for index, segment in enumerate(plan.segments):
+        if segment.provider_text is None:
+            body = segment.original
         else:
-            line_result = _run_provider(segment, use_cache=_use_cache)
+            body = segment_results.get(index)
+            if not body:
+                succeeded = False
+                if not segment.placeholder_map:
+                    # Failed plain segments preserve the original placement
+                    # of URLs and emoji, just like the scalar pipeline.
+                    rendered.append(segment.original)
+                    continue
+                body = segment.provider_text
+            body = _restore_glossary(body, segment.placeholder_map)
+            if not body:
+                rendered.append(segment.original)
+                continue
+        if segment.urls:
+            body += "  " + " ".join(segment.urls)
+        if segment.unicode_emojis:
+            body += "  " + " ".join(segment.unicode_emojis)
+        rendered.append(body)
 
-        if not line_result:
-            log_event(f"[translate] all attempts failed ({src}->{dest}): {repr(segment)}")
-            translated_lines.append(line_stripped)
-            continue
+    result = plan.separator.join(rendered)
+    if result and plan.custom_emojis:
+        result += "  " + " ".join(plan.custom_emojis)
+    if plan.mentions:
+        result = "  ".join(part for part in (result, " ".join(plan.mentions)) if part)
+    return TranslationOutcome(result or None, succeeded)
 
-        if line_urls:
-            line_result = line_result + "  " + " ".join(line_urls)
-        if line_emojis:
-            line_result = line_result + "  " + " ".join(line_emojis)
 
-        translated_lines.append(line_result)
+def _translate_many_with_source_status(
+    text: str,
+    source_lang: str,
+    target_langs: list[str],
+    glossary: dict | None = None,
+    substitutions: dict | None = None,
+    _use_cache: bool = True,
+) -> dict[str, TranslationOutcome]:
+    """Plan each target, share identical provider inputs, then render separately."""
+    source = normalize_lang(source_lang)
+    targets = list(dict.fromkeys(normalize_lang(target) for target in target_langs))
+    plans = {
+        target: _build_target_plan(text, source, target, glossary, substitutions)
+        for target in targets
+    }
+    results: dict[str, dict[int, str | None]] = {target: {} for target in targets}
+    jobs: dict[str, list[tuple[str, int]]] = {}
+    cache = None
+    for target, plan in plans.items():
+        for index, segment in enumerate(plan.segments):
+            if segment.provider_text is None:
+                continue
+            if _use_cache and cache is None:
+                cache = _get_translate_cache()
+            key = (segment.provider_text, source, target)
+            cached = cache.get(key) if cache is not None else None
+            if cached:
+                results[target][index] = cached
+            else:
+                jobs.setdefault(segment.provider_text, []).append((target, index))
 
-    result = "\n".join(translated_lines)
-    if not result:
-        return _with_mentions("") if mentions else None
+    for provider_text, consumers in jobs.items():
+        job_targets = list(dict.fromkeys(target for target, _ in consumers))
+        if len(targets) == 1:
+            # Preserve the scalar hook used by existing integrations; the
+            # adapter delegates to the provider's batch API when available.
+            target = job_targets[0]
+            translated = {target: _translate_with_fallback(provider_text, source, target)}
+        else:
+            translated = _get_provider_chain().translate_many(provider_text, source, job_targets)
+            for target in job_targets:
+                _log_translate_event(source, target, provider_text, translated.get(target))
+        for target in job_targets:
+            value = translated.get(target)
+            if value and cache is not None:
+                cache[(provider_text, source, target)] = value
+            if not value:
+                log_event(f"[translate] all attempts failed ({source}->{target}): {repr(provider_text)}")
+        for target, index in consumers:
+            results[target][index] = translated.get(target)
 
-    if emojis:
-        result = result + "  " + " ".join(emojis)
+    return {target: _render_target_plan(plan, results[target]) for target, plan in plans.items()}
 
-    return _with_mentions(result)
+
+def translate_many_with_status(
+    text: str,
+    target_langs: list[str],
+    glossary: dict | None = None,
+    substitutions: dict | None = None,
+    _use_cache: bool = True,
+) -> dict[str, TranslationOutcome]:
+    """Translate unique canonical targets using provider source detection."""
+    return _translate_many_with_source_status(
+        text, "auto", target_langs, glossary, substitutions, _use_cache
+    )
 
 
 def translate_text_with_status(
@@ -378,17 +475,33 @@ def translate_text_with_status(
     _use_cache: bool = True,
 ) -> TranslationOutcome:
     """Translate while preserving whether every required provider call succeeded."""
-    status = _TranslationStatus()
-    result = translate_text(
-        text,
-        source_lang,
-        target_lang,
-        glossary,
-        substitutions,
-        _use_cache,
-        _status=status,
+    target = normalize_lang(target_lang)
+    return _translate_many_with_source_status(
+        text, source_lang, [target], glossary, substitutions, _use_cache
+    )[target]
+
+
+def translate_text(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    glossary: dict | None = None,
+    substitutions: dict | None = None,
+    _use_cache: bool = True,
+) -> str | None:
+    return translate_text_with_status(
+        text, source_lang, target_lang, glossary, substitutions, _use_cache
+    ).text
+
+
+def get_translation_status(*, probe_libre: bool = True) -> dict:
+    """Return the provider's sanitized snapshot and optional bounded probe."""
+    chain = _get_provider_chain()
+    result = chain.status_snapshot()
+    result["libretranslate_probe"] = (
+        chain.probe_libretranslate(timeout=5.0) if probe_libre else None
     )
-    return TranslationOutcome(result, status.provider_succeeded)
+    return result
 
 
 def translate_text_nocache(
