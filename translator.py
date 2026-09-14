@@ -3,6 +3,7 @@ import re
 import json
 import time
 import threading
+from dataclasses import dataclass
 import diskcache
 from translation_providers import (
     ProviderSettings,
@@ -20,6 +21,17 @@ _log_lock = threading.Lock()
 _translate_cache: diskcache.Cache | None = None
 _provider_chain: TranslationProviderChain | None = None
 _provider_chain_lock = threading.Lock()
+
+
+@dataclass(frozen=True)
+class TranslationOutcome:
+    text: str | None
+    provider_succeeded: bool
+
+
+@dataclass
+class _TranslationStatus:
+    provider_succeeded: bool = True
 
 
 def _get_translate_cache() -> diskcache.Cache:
@@ -193,6 +205,7 @@ def translate_text(
     glossary: dict | None = None,
     substitutions: dict | None = None,
     _use_cache: bool = True,
+    _status: _TranslationStatus | None = None,
 ) -> str | None:
     src = normalize_lang(source_lang)
     dest = normalize_lang(target_lang)
@@ -217,6 +230,13 @@ def translate_text(
             return body
         parts = [p for p in (body, " ".join(mentions)) if p]
         return "  ".join(parts)
+
+    def _run_provider(segment: str, *, use_cache: bool) -> str | None:
+        operation = _cached_translate if use_cache else _translate_with_fallback
+        translated = operation(segment, src, dest)
+        if not translated and _status is not None:
+            _status.provider_succeeded = False
+        return translated
 
     # Apply pre-translation substitutions (e.g. aliases / euphemisms)
     if substitutions:
@@ -285,7 +305,7 @@ def translate_text(
         len(lines) > 1
         and not any(_line_needs_extraction(line) or _line_matches_glossary(line) for line in lines)
     ):
-        block_result = (_cached_translate if _use_cache else _translate_with_fallback)(clean, src, dest)
+        block_result = _run_provider(clean, use_cache=_use_cache)
         if not block_result:
             log_event(f"[translate] all attempts failed ({src}->{dest}): {repr(clean)}")
             block_result = clean
@@ -319,13 +339,13 @@ def translate_text(
             if not remainder:
                 line_result = _restore_glossary(segment, placeholder_map)
             else:
-                line_result = _translate_with_fallback(segment, src, dest)
+                line_result = _run_provider(segment, use_cache=False)
                 if line_result:
                     line_result = _restore_glossary(line_result, placeholder_map)
                 else:
                     line_result = _restore_glossary(segment, placeholder_map)
         else:
-            line_result = (_cached_translate if _use_cache else _translate_with_fallback)(segment, src, dest)
+            line_result = _run_provider(segment, use_cache=_use_cache)
 
         if not line_result:
             log_event(f"[translate] all attempts failed ({src}->{dest}): {repr(segment)}")
@@ -347,6 +367,28 @@ def translate_text(
         result = result + "  " + " ".join(emojis)
 
     return _with_mentions(result)
+
+
+def translate_text_with_status(
+    text: str,
+    source_lang: str,
+    target_lang: str,
+    glossary: dict | None = None,
+    substitutions: dict | None = None,
+    _use_cache: bool = True,
+) -> TranslationOutcome:
+    """Translate while preserving whether every required provider call succeeded."""
+    status = _TranslationStatus()
+    result = translate_text(
+        text,
+        source_lang,
+        target_lang,
+        glossary,
+        substitutions,
+        _use_cache,
+        _status=status,
+    )
+    return TranslationOutcome(result, status.provider_succeeded)
 
 
 def translate_text_nocache(

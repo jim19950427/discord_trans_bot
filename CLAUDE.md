@@ -70,9 +70,11 @@ Order matters and each stage exists because of a specific failure mode observed 
 
 `translator.py` owns text transformation and cache; `translation_providers.py` owns all external translation. `bot.py` must not import provider implementations. Azure is primary; internal LibreTranslate is the fallback. `zh-TW` maps only at provider boundaries: Azure `zh-Hant`, LibreTranslate `zt`. Equal non-empty output is provider success. The in-memory breaker is thread-safe and permits one half-open probe; LibreTranslate concurrency is two and its port is never published. Provider errors are sanitized: keys and webhook URLs are forbidden in logs. Every mounted Python source file must be present in both the source watcher and deploy list.
 
+Channel language settings are destination languages only. Every user-authored message, edit, thread name, retry, and context-menu translation uses source `auto`, so users may type any language in any configured channel. A successful non-empty result equal to the input is valid (for example English detected while targeting English) and must not be scheduled as a provider failure.
+
 Google's previous mobile-page scraper failed behind CAPTCHA/rate limits and could cache error pages. Keep that history only as a reason never to restore it to the runtime chain.
 
-`has_translatable_content()` mirrors `translate_text`'s own "nothing to actually translate" checks (mentions/custom-emoji/Unicode-emoji/URL-only content) and exists specifically so callers (the retry-scheduling logic in `bot.py`) can tell "translation intentionally returned unchanged" apart from "translation actually failed" — don't let these two drift out of sync if either changes.
+`has_translatable_content()` mirrors `translate_text`'s own "nothing to actually translate" checks (mentions/custom-emoji/Unicode-emoji/URL-only content), so those messages do not enter retry scheduling. For real translation attempts, `translate_text_with_status()` carries explicit provider success separately from text; never infer failure by comparing output with input.
 
 ### Structured logging (`log_event` in `translator.py`)
 
