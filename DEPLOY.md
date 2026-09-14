@@ -122,3 +122,27 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 
 > **什麼時候才需要重新建置 Image？**  
 > 只有當 `requirements.txt` 內的套件版本有變更時，才需要在 Container Manager 專案中選擇 **重新建置（Build）**。一般程式邏輯的更新不需要此步驟。
+
+---
+
+## 四、Azure 與 NAS LibreTranslate 備援
+
+1. 只在 NAS 的 `/volume1/docker/discord-trans-bot/.env` 設定 Azure Key 1：`AZURE_TRANSLATOR_KEY=...`；`AZURE_TRANSLATOR_REGION=eastasia`，endpoint 使用 `https://api.cognitive.microsofttranslator.com`。不要把真實 key 貼進終端機參數、shell history 或聊天。
+2. 上傳新版後執行 `./deploy.sh --with-deps`，再到 Container Manager 重新建置 `discord-trans-bot` image，因為 Python 依賴已變更。
+3. 啟動 LibreTranslate。第一次下載模型可能需要數分鐘，health status 顯示 `starting` 是正常的；其 port 不會發布到 NAS 外部。
+4. 以 SSH 驗證：
+
+```bash
+cd /volume1/docker/discord-trans-bot
+sudo docker compose ps
+sudo docker compose exec discord-trans-bot python -c "import requests; print([x['code'] for x in requests.get('http://libretranslate:5000/languages', timeout=10).json()])"
+```
+
+5. 用 Discord 傳送測試訊息驗證 Azure，並檢查已清除敏感資料的 provider event：
+
+```bash
+python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.json"; rows=json.load(open(p)); print(*[({k:r.get(k) for k in ("time","provider","success","latency_ms","fallback_reason","circuit_state")}) for r in rows if r.get("type")=="translate_provider"][-10:], sep="\n")'
+```
+
+6. 要測試備援時，暫時把 NAS `.env` 的 key 改為字面值 `invalid-test-key`，只重建 bot container，送一段未快取文字，確認 `provider=libretranslate`；隨即還原 Key 1 並再次重建 bot。切勿將真 key 放在命令列。
+7. 輪替金鑰時先讓 bot 改用 Key 2、重建並確認 Azure 成功，最後才在 Azure portal 重新產生 Key 1。

@@ -6,6 +6,8 @@
 
 > 🛠️ **部署說明**請見 [DEPLOY.md](DEPLOY.md)
 
+> 翻譯平時使用 Azure Translator；Azure 發生配額、連線或服務問題時，會自動改用 NAS 上的 LibreTranslate／Argos。本機備援對非英文語言組合可能經英文轉譯，品質可能較低；所有指令與使用方式不變。
+
 ---
 
 ## 運作方式
