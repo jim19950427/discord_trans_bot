@@ -39,6 +39,18 @@ def map_language(code: str, provider: str) -> str:
     return _PROVIDER_OVERRIDES.get(provider, {}).get(canonical, canonical)
 
 
+def _unique_canonical_targets(targets: list[str]) -> list[str]:
+    return list(dict.fromkeys(canonicalize_language(target) for target in targets))
+
+
+def _azure_params(source: str, targets: list[str]) -> list[tuple[str, str]]:
+    params = [("api-version", "3.0")]
+    params.extend(("to", map_language(target, "azure")) for target in targets)
+    if source.lower() != "auto":
+        params.append(("from", map_language(source, "azure")))
+    return params
+
+
 @dataclass(frozen=True)
 class ProviderSettings:
     provider_order: tuple[str, ...]
@@ -218,10 +230,9 @@ class TranslationProviderChain:
                 **fields,
             )
 
-    def _azure_translate(self, text: str, source: str, target: str) -> str:
-        params = {"api-version": "3.0", "to": map_language(target, "azure")}
-        if source.lower() != "auto":
-            params["from"] = map_language(source, "azure")
+    def _azure_translate_many(
+        self, text: str, source: str, targets: list[str]
+    ) -> dict[str, str]:
         headers = {
             "Ocp-Apim-Subscription-Key": self.settings.azure_key,
             "Ocp-Apim-Subscription-Region": self.settings.azure_region,
@@ -231,7 +242,7 @@ class TranslationProviderChain:
         try:
             response = self._post(
                 f"{self.settings.azure_endpoint}/translate",
-                params=params,
+                params=_azure_params(source, targets),
                 headers=headers,
                 json=[{"Text": text}],
                 timeout=self.settings.azure_timeout,
@@ -244,7 +255,32 @@ class TranslationProviderChain:
             payload = response.json()
         except (TypeError, ValueError) as exc:
             raise ProviderError("invalid_json", type(exc).__name__) from exc
-        return _response_text(payload, "azure")
+        try:
+            translations = payload[0]["translations"]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise ProviderError("invalid_response", type(exc).__name__) from exc
+        if not isinstance(translations, list):
+            raise ProviderError("invalid_response", type(translations).__name__)
+
+        targets_by_azure_code = {
+            map_language(target, "azure").lower(): target for target in targets
+        }
+        results = {}
+        for translation in translations:
+            if not isinstance(translation, dict):
+                continue
+            translated_text = translation.get("text")
+            response_target = translation.get("to")
+            if not isinstance(translated_text, str) or not translated_text.strip():
+                continue
+            if not isinstance(response_target, str):
+                continue
+            target = targets_by_azure_code.get(response_target.lower())
+            if target is not None:
+                results[target] = translated_text
+        if not results:
+            raise ProviderError("invalid_response")
+        return results
 
     def _log_missing_key_once(self, source: str, target: str) -> None:
         with self._diagnostic_lock:
@@ -284,18 +320,26 @@ class TranslationProviderChain:
             raise ProviderError("invalid_json", type(exc).__name__) from exc
         return _response_text(payload, "libretranslate")
 
-    def translate(self, text: str, source: str, target: str) -> str | None:
+    def translate_many(
+        self, text: str, source: str, targets: list[str]
+    ) -> dict[str, str | None]:
+        targets = _unique_canonical_targets(targets)
+        results: dict[str, str | None] = {target: None for target in targets}
+        unresolved = list(targets)
+
         for provider in self.settings.provider_order:
+            if not unresolved:
+                break
             if provider == "azure":
                 if not self.settings.azure_key:
-                    self._log_missing_key_once(source, target)
+                    self._log_missing_key_once(source, unresolved[0])
                     continue
                 allowed, state, generation = self._circuit.admit_request()
                 if not allowed:
                     self._emit(
                         "azure",
                         source,
-                        target,
+                        ",".join(unresolved),
                         success=False,
                         latency_ms=0,
                         fallback_reason="circuit_open",
@@ -304,13 +348,13 @@ class TranslationProviderChain:
                     continue
                 started = self._monotonic()
                 try:
-                    result = self._azure_translate(text, source, target)
+                    azure_results = self._azure_translate_many(text, source, unresolved)
                 except ProviderError as error:
                     transition = self._circuit.record_failure(generation)
                     self._emit(
                         "azure",
                         source,
-                        target,
+                        ",".join(unresolved),
                         success=False,
                         latency_ms=int((self._monotonic() - started) * 1000),
                         fallback_reason=error.category,
@@ -322,38 +366,46 @@ class TranslationProviderChain:
                 self._emit(
                     "azure",
                     source,
-                    target,
+                    ",".join(unresolved),
                     success=True,
                     latency_ms=int((self._monotonic() - started) * 1000),
                     fallback_reason=None,
                     circuit_state=transition or self._circuit.state,
                 )
-                return result
+                results.update(azure_results)
+                unresolved = [target for target in unresolved if target not in azure_results]
+                continue
 
             if provider == "libretranslate":
-                started = self._monotonic()
-                try:
-                    result = self._libretranslate_translate(text, source, target)
-                except ProviderError as error:
+                for target in list(unresolved):
+                    started = self._monotonic()
+                    try:
+                        result = self._libretranslate_translate(text, source, target)
+                    except ProviderError as error:
+                        self._emit(
+                            "libretranslate",
+                            source,
+                            target,
+                            success=False,
+                            latency_ms=int((self._monotonic() - started) * 1000),
+                            fallback_reason=error.category,
+                            error_detail=error.detail or None,
+                            circuit_state=self._circuit.state,
+                        )
+                        continue
                     self._emit(
                         "libretranslate",
                         source,
                         target,
-                        success=False,
+                        success=True,
                         latency_ms=int((self._monotonic() - started) * 1000),
-                        fallback_reason=error.category,
-                        error_detail=error.detail or None,
+                        fallback_reason=None,
                         circuit_state=self._circuit.state,
                     )
-                    continue
-                self._emit(
-                    "libretranslate",
-                    source,
-                    target,
-                    success=True,
-                    latency_ms=int((self._monotonic() - started) * 1000),
-                    fallback_reason=None,
-                    circuit_state=self._circuit.state,
-                )
-                return result
-        return None
+                    results[target] = result
+                    unresolved.remove(target)
+        return results
+
+    def translate(self, text: str, source: str, target: str) -> str | None:
+        target = canonicalize_language(target)
+        return self.translate_many(text, source, [target])[target]

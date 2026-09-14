@@ -172,7 +172,9 @@ def test_azure_request_maps_traditional_chinese_and_keeps_equal_output():
 
     assert chain.translate("Jim", "en", "zh-TW") == "Jim"
     _, kwargs = post.call_args
-    assert kwargs["params"] == {"api-version": "3.0", "from": "en", "to": "zh-Hant"}
+    assert kwargs["params"] == [
+        ("api-version", "3.0"), ("to", "zh-Hant"), ("from", "en")
+    ]
     assert kwargs["json"] == [{"Text": "Jim"}]
     assert kwargs["timeout"] == 5.0
     assert kwargs["headers"]["Ocp-Apim-Subscription-Key"] == "test-key"
@@ -190,6 +192,81 @@ def test_azure_auto_detection_omits_from_parameter():
 
     assert chain.translate("你好", "auto", "en") == "hello"
     assert "from" not in post.call_args.kwargs["params"]
+
+
+def test_azure_batch_uses_repeated_targets_and_response_language_keys():
+    post = Mock(return_value=FakeResponse(payload=[{"translations": [
+        {"text": "\u3053\u3093\u306b\u3061\u306f", "to": "ja"},
+        {"text": "\u4f60\u597d", "to": "zh-Hant"},
+        {"text": "Hallo", "to": "de"},
+    ]}]))
+    chain = TranslationProviderChain(
+        make_settings(provider_order=("azure",)), post=post
+    )
+
+    result = chain.translate_many("hello", "auto", ["zh-TW", "de", "ja", "de"])
+
+    assert result == {"zh-TW": "\u4f60\u597d", "de": "Hallo", "ja": "\u3053\u3093\u306b\u3061\u306f"}
+    assert post.call_count == 1
+    assert post.call_args.kwargs["params"] == [
+        ("api-version", "3.0"), ("to", "zh-Hant"),
+        ("to", "de"), ("to", "ja"),
+    ]
+
+
+def test_azure_partial_batch_falls_back_only_for_missing_target():
+    post = Mock(side_effect=[
+        FakeResponse(payload=[{"translations": [
+            {"text": "bonjour", "to": "fr"},
+        ]}]),
+        FakeResponse(payload={"translatedText": "\u3053\u3093\u306b\u3061\u306f"}),
+    ])
+    chain = TranslationProviderChain(make_settings(), post=post)
+
+    result = chain.translate_many("hello", "en", ["fr", "ja"])
+
+    assert result == {"fr": "bonjour", "ja": "\u3053\u3093\u306b\u3061\u306f"}
+    assert post.call_count == 2
+    assert post.call_args_list[1].kwargs["json"]["target"] == "ja"
+
+
+def test_failed_eight_target_azure_batch_counts_as_one_circuit_failure():
+    chain = TranslationProviderChain(
+        make_settings(provider_order=("azure",)),
+        post=Mock(return_value=FakeResponse(status_code=500)),
+    )
+
+    result = chain.translate_many(
+        "hello", "en", ["en", "es", "fr", "ja", "ko", "pl", "ru", "th"]
+    )
+
+    assert result == {
+        "en": None, "es": None, "fr": None, "ja": None,
+        "ko": None, "pl": None, "ru": None, "th": None,
+    }
+    assert chain._circuit._failures == 1
+
+
+def test_missing_azure_key_skips_one_batch_attempt_then_uses_libre_per_target():
+    logs = []
+    post = Mock(side_effect=[
+        FakeResponse(payload={"translatedText": "bonjour"}),
+        FakeResponse(payload={"translatedText": "\u3053\u3093\u306b\u3061\u306f"}),
+    ])
+    chain = TranslationProviderChain(
+        make_settings(azure_key=None),
+        post=post,
+        logger=lambda message, **fields: logs.append((message, fields)),
+    )
+
+    assert chain.translate_many("hello", "en", ["fr", "ja"]) == {
+        "fr": "bonjour", "ja": "\u3053\u3093\u306b\u3061\u306f"
+    }
+    assert post.call_count == 2
+    assert len([
+        fields for _, fields in logs
+        if fields.get("fallback_reason") == "missing_key"
+    ]) == 1
 
 
 @pytest.mark.parametrize(
@@ -344,7 +421,7 @@ def test_stale_azure_success_does_not_close_open_circuit():
         if call_number == 1:
             first_started.set()
             assert release_first.wait(timeout=2)
-            return FakeResponse(payload=[{"translations": [{"text": "first"}]}])
+            return FakeResponse(payload=[{"translations": [{"text": "first", "to": "fr"}]}])
         return FakeResponse(status_code=500)
 
     chain = TranslationProviderChain(
