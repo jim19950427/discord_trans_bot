@@ -78,6 +78,12 @@ _UNICODE_EMOJI_RE = re.compile(
 _URL_RE = re.compile(r"https?://\S+")
 # Matches any real word character (letters/digits from any script, incl. CJK)
 _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
+# Script hints for short mixed-language messages where provider auto-detection
+# can over-weight Latin words and leave embedded Chinese untranslated.
+_HAN_RE = re.compile("[\u3400-\u4dbf\u4e00-\u9fff\U00020000-\U0002fa1f]")
+_LATIN_RE = re.compile("[A-Za-z]")
+_JAPANESE_KANA_RE = re.compile("[\u3040-\u30ff\u31f0-\u31ff]")
+_HANGUL_RE = re.compile("[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
 # Characters str.splitlines() treats as line boundaries but that Discord
 # never renders as visible line breaks — typically invisible copy-paste
 # artifacts (e.g. \x1d Group Separator) from other apps. Left in place,
@@ -85,6 +91,19 @@ _HAS_WORD_RE = re.compile(r"\w", re.UNICODE)
 _STRAY_LINEBREAK_RE = re.compile("[\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 def normalize_lang(code: str) -> str:
     return canonicalize_language(code)
+
+
+def _provider_source_language(text: str, requested_source: str) -> str:
+    if requested_source != "auto":
+        return requested_source
+    if (
+        _HAN_RE.search(text)
+        and _LATIN_RE.search(text)
+        and not _JAPANESE_KANA_RE.search(text)
+        and not _HANGUL_RE.search(text)
+    ):
+        return "zh-TW"
+    return requested_source
 
 
 def has_translatable_content(text: str) -> bool:
@@ -409,6 +428,7 @@ def _translate_many_with_source_status(
 ) -> dict[str, TranslationOutcome]:
     """Plan each target, share identical provider inputs, then render separately."""
     source = normalize_lang(source_lang)
+    provider_source = _provider_source_language(text, source)
     targets = list(dict.fromkeys(normalize_lang(target) for target in target_langs))
     plans = {
         target: _build_target_plan(text, source, target, glossary, substitutions)
@@ -423,7 +443,7 @@ def _translate_many_with_source_status(
                 continue
             if _use_cache and cache is None:
                 cache = _get_translate_cache()
-            key = (segment.provider_text, source, target)
+            key = (segment.provider_text, provider_source, target)
             cached = cache.get(key) if cache is not None else None
             if cached:
                 results[target][index] = cached
@@ -432,21 +452,39 @@ def _translate_many_with_source_status(
 
     for provider_text, consumers in jobs.items():
         job_targets = list(dict.fromkeys(target for target, _ in consumers))
-        if len(targets) == 1:
+        translated: dict[str, str | None] = {
+            target: provider_text
+            for target in job_targets
+            if target == provider_source
+        }
+        provider_targets = [
+            target for target in job_targets if target != provider_source
+        ]
+        if len(targets) == 1 and provider_targets:
             # Preserve the scalar hook used by existing integrations; the
             # adapter delegates to the provider's batch API when available.
-            target = job_targets[0]
-            translated = {target: _translate_with_fallback(provider_text, source, target)}
-        else:
-            translated = _get_provider_chain().translate_many(provider_text, source, job_targets)
-            for target in job_targets:
-                _log_translate_event(source, target, provider_text, translated.get(target))
+            target = provider_targets[0]
+            translated[target] = _translate_with_fallback(
+                provider_text, provider_source, target
+            )
+        elif provider_targets:
+            provider_results = _get_provider_chain().translate_many(
+                provider_text, provider_source, provider_targets
+            )
+            translated.update(provider_results)
+            for target in provider_targets:
+                _log_translate_event(
+                    provider_source, target, provider_text, translated.get(target)
+                )
         for target in job_targets:
             value = translated.get(target)
             if value and cache is not None:
-                cache[(provider_text, source, target)] = value
+                cache[(provider_text, provider_source, target)] = value
             if not value:
-                log_event(f"[translate] all attempts failed ({source}->{target}): {repr(provider_text)}")
+                log_event(
+                    f"[translate] all attempts failed "
+                    f"({provider_source}->{target}): {repr(provider_text)}"
+                )
         for target, index in consumers:
             results[target][index] = translated.get(target)
 

@@ -3,6 +3,55 @@ import pytest
 import translator
 
 
+@pytest.mark.parametrize(
+    ("text", "expected_source"),
+    [
+        ("money不是monkey", "zh-TW"),
+        ("純中文訊息", "auto"),
+        ("東京", "auto"),
+        ("moneyではmonkey", "auto"),
+        ("money는monkey", "auto"),
+        ("money is not monkey", "auto"),
+    ],
+)
+def test_auto_source_hints_chinese_without_overriding_japanese_or_korean(
+    monkeypatch, text, expected_source
+):
+    calls = []
+
+    class Chain:
+        def translate_many(self, provider_text, source, targets):
+            calls.append((provider_text, source, list(targets)))
+            return {target: "translated" for target in targets}
+
+    monkeypatch.setattr(translator, "_get_provider_chain", lambda: Chain())
+
+    translator.translate_many_with_status(text, ["en"], _use_cache=False)
+
+    assert calls == [(text, expected_source, ["en"])]
+
+
+def test_inferred_chinese_source_preserves_same_language_destination(monkeypatch):
+    calls = []
+
+    class Chain:
+        def translate_many(self, text, source, targets):
+            calls.append((text, source, list(targets)))
+            return {"en": "money is not monkey"}
+
+    monkeypatch.setattr(translator, "_get_provider_chain", lambda: Chain())
+
+    result = translator.translate_many_with_status(
+        "money不是monkey", ["zh-TW", "en"], _use_cache=False
+    )
+
+    assert calls == [("money不是monkey", "zh-TW", ["en"])]
+    assert result == {
+        "zh-TW": translator.TranslationOutcome("money不是monkey", True),
+        "en": translator.TranslationOutcome("money is not monkey", True),
+    }
+
+
 def test_translate_many_batches_unique_targets(monkeypatch):
     calls = []
 
