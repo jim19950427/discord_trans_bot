@@ -45,7 +45,11 @@ def _unique_canonical_targets(targets: list[str]) -> list[str]:
 
 def _azure_params(source: str, targets: list[str]) -> list[tuple[str, str]]:
     params = [("api-version", "3.0")]
-    params.extend(("to", map_language(target, "azure")) for target in targets)
+    wire_targets = {}
+    for target in targets:
+        wire_code = map_language(target, "azure")
+        wire_targets.setdefault(wire_code.lower(), wire_code)
+    params.extend(("to", code) for code in wire_targets.values())
     if source.lower() != "auto":
         params.append(("from", map_language(source, "azure")))
     return params
@@ -366,27 +370,38 @@ class TranslationProviderChain:
         if not isinstance(translations, list):
             raise ProviderError("invalid_response", type(translations).__name__)
 
-        targets_by_azure_code = {
-            map_language(target, "azure").lower(): target for target in targets
-        }
-        results = {}
+        targets_by_azure_code: dict[str, list[str]] = {}
+        for target in targets:
+            wire_code = map_language(target, "azure").lower()
+            targets_by_azure_code.setdefault(wire_code, []).append(target)
+        results_by_code = {}
+        seen_codes = set()
         for translation in translations:
             if not isinstance(translation, dict):
                 continue
             translated_text = translation.get("text")
             response_target = translation.get("to")
-            if not isinstance(translated_text, str) or not translated_text.strip():
-                continue
             if not isinstance(response_target, str):
                 continue
-            target = targets_by_azure_code.get(response_target.lower())
-            if target is not None:
-                results[target] = translated_text
+            wire_code = response_target.lower()
+            if wire_code not in targets_by_azure_code:
+                continue
+            if wire_code in seen_codes:
+                results_by_code.pop(wire_code, None)
+                continue
+            seen_codes.add(wire_code)
+            if isinstance(translated_text, str) and translated_text.strip():
+                results_by_code[wire_code] = translated_text
+        results = {
+            target: translated_text
+            for wire_code, translated_text in results_by_code.items()
+            for target in targets_by_azure_code[wire_code]
+        }
         if not results:
             raise ProviderError("invalid_response")
         return results
 
-    def _log_missing_key_once(self, source: str, target: str) -> None:
+    def _log_missing_key_once(self, source: str, targets: list[str]) -> None:
         with self._diagnostic_lock:
             if self._missing_key_logged:
                 return
@@ -394,9 +409,10 @@ class TranslationProviderChain:
         self._emit(
             "azure",
             source,
-            target,
+            ",".join(targets),
             success=False,
             latency_ms=0,
+            target_count=len(targets),
             fallback_reason="missing_key",
             circuit_state=self._circuit.state,
         )
@@ -436,7 +452,7 @@ class TranslationProviderChain:
                 break
             if provider == "azure":
                 if not self.settings.azure_key:
-                    self._log_missing_key_once(source, unresolved[0])
+                    self._log_missing_key_once(source, unresolved)
                     self._record_fallback("missing_key")
                     continue
                 allowed, state, generation = self._circuit.admit_request()
@@ -448,6 +464,7 @@ class TranslationProviderChain:
                         ",".join(unresolved),
                         success=False,
                         latency_ms=0,
+                        target_count=len(unresolved),
                         fallback_reason="circuit_open",
                         circuit_state=state,
                     )
@@ -473,6 +490,7 @@ class TranslationProviderChain:
                         success=False,
                         latency_ms=latency_ms,
                         fallback_reason=error.category,
+                        target_count=len(unresolved),
                         error_detail=error.detail or None,
                         circuit_state=transition or self._circuit.state,
                     )
@@ -491,11 +509,14 @@ class TranslationProviderChain:
                     ",".join(unresolved),
                     success=True,
                     latency_ms=latency_ms,
+                    target_count=len(unresolved),
                     fallback_reason=None,
                     circuit_state=transition or self._circuit.state,
                 )
                 results.update(azure_results)
                 unresolved = [target for target in unresolved if target not in azure_results]
+                if unresolved:
+                    self._record_fallback("partial_response")
                 continue
 
             if provider == "libretranslate":

@@ -141,10 +141,12 @@ sudo docker compose exec discord-trans-bot python -c "import requests; print([x[
 5. 用 Discord 傳送測試訊息驗證 Azure，並檢查已清除敏感資料的 provider event：
 
 ```bash
-python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.json"; rows=json.load(open(p)); print(*[({k:r.get(k) for k in ("time","provider","success","latency_ms","fallback_reason","circuit_state")}) for r in rows if r.get("type")=="translate_provider"][-10:], sep="\n")'
+python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.json"; rows=json.load(open(p)); print(*[({k:r.get(k) for k in ("time","provider","success","target_count","latency_ms","fallback_reason","circuit_state")}) for r in rows if r.get("type")=="translate_provider"][-10:], sep="\n")'
 ```
+
+   批次驗收時，從 `zh-TW` 頻道送出一段未快取的英文，目標設為 `en`、`ja`、`ko`，且不含會拆分輸入的詞彙表內容。預期英文照常送達，日文與韓文各送到正確頻道；上列查詢在此次測試時間應顯示一筆 `provider=azure`、`success=True`、`target_count=3` 的事件。一般情況下，每個相容且未快取的提供者輸入群組各有一筆 Azure 事件；`target_count` 是該批去重後的目標鍵數，不是頻道數。指向同一 Azure 代碼的別名共用一個 `to` 參數，但仍各算一個目標鍵。缺 key 或斷路器開啟時的略過事件也有此欄位，不代表實際送出 Azure 請求。
 
 6. 要測試備援時，暫時把 NAS `.env` 的 key 改為字面值 `invalid-test-key`，只重建 bot container，送一段未快取文字，確認 `provider=libretranslate`；隨即還原 Key 1 並再次重建 bot。切勿將真 key 放在命令列。
 7. 輪替金鑰時先讓 bot 改用 Key 2、重建並確認 Azure 成功，最後才在 Azure portal 重新產生 Key 1。
-8. 要新增 LibreTranslate 備援語言時，必須將相應 Libre 語言代碼加入 `docker-compose.yml` 的 `LT_LOAD_ONLY`，以 `./deploy.sh --with-deps` 上傳並重建 image；Azure 支援的新語言本身不需要修改這份清單。
+8. 要新增 LibreTranslate 備援語言時，必須將相應 Libre 語言代碼加入 `docker-compose.yml` 的 `LT_LOAD_ONLY`，以 `./deploy.sh --with-deps` 上傳，再於 NAS 專案目錄執行 `sudo docker compose up -d --force-recreate libretranslate`，或在 Container Manager 重新建立 LibreTranslate 服務的 container，才能套用環境變數。單純重建 image 或重新啟動舊 container 不會更新環境設定。待 `/languages` 顯示新增代碼後再驗收；Azure 支援的新語言本身不需要修改這份清單。
 9. 以有「管理頻道」權限的帳號執行 `/translation-status`。回覆應只對該使用者可見，並顯示 Azure 批次健康、Libre `/languages` 探測與最近備援資訊；畫面不得包含金鑰、Webhook URL、原文或譯文。

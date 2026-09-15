@@ -1328,6 +1328,7 @@ _STATUS_UNAVAILABLE = "尚無資料"
 _SAFE_STATUS_REASONS = frozenset({
     "request_error", "invalid_json", "invalid_response", "circuit_open",
     "azure_failed", "libretranslate_failed", "missing_key", "empty_response",
+    "partial_response",
 })
 _SAFE_CIRCUIT_STATES = frozenset({"closed", "open", "half_open"})
 

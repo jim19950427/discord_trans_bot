@@ -221,13 +221,85 @@ def test_azure_partial_batch_falls_back_only_for_missing_target():
         ]}]),
         FakeResponse(payload={"translatedText": "\u3053\u3093\u306b\u3061\u306f"}),
     ])
-    chain = TranslationProviderChain(make_settings(), post=post)
+    chain = TranslationProviderChain(
+        make_settings(), post=post, wall_clock=lambda: 1234.0
+    )
 
     result = chain.translate_many("hello", "en", ["fr", "ja"])
 
     assert result == {"fr": "bonjour", "ja": "\u3053\u3093\u306b\u3061\u306f"}
     assert post.call_count == 2
     assert post.call_args_list[1].kwargs["json"]["target"] == "ja"
+    assert chain.status_snapshot()["fallback"] == {
+        "last_at": 1234.0, "reason": "partial_response"
+    }
+
+
+@pytest.mark.parametrize("duplicate_text", ["conflicting result", "", None])
+def test_duplicate_azure_target_remains_unresolved_for_libre(duplicate_text):
+    """An ambiguous repeated destination must never win over the fallback result."""
+    post = Mock(side_effect=[
+        FakeResponse(payload=[{"translations": [
+            {"text": "bonjour", "to": "fr"},
+            {"text": "first result", "to": "ja"},
+            {"text": duplicate_text, "to": "JA"},
+        ]}]),
+        FakeResponse(payload={"translatedText": "こんにちは"}),
+    ])
+    chain = TranslationProviderChain(make_settings(), post=post)
+
+    assert chain.translate_many("hello", "auto", ["fr", "ja"]) == {
+        "fr": "bonjour", "ja": "こんにちは"
+    }
+    assert post.call_count == 2
+    assert post.call_args_list[1].kwargs["json"]["target"] == "ja"
+
+
+def test_azure_wire_aliases_share_one_target_and_resolve_every_requested_key():
+    """Colliding provider aliases must not duplicate parameters or lose a result key."""
+    post = Mock(return_value=FakeResponse(payload=[{"translations": [
+        {"text": "你好", "to": "zh-Hant"},
+    ]}]))
+    chain = TranslationProviderChain(make_settings(), post=post)
+
+    assert chain.translate_many("hello", "auto", ["zh-TW", "zh-Hant"]) == {
+        "zh-TW": "你好", "zh-Hant": "你好"
+    }
+    assert post.call_count == 1
+    assert post.call_args.kwargs["params"] == [
+        ("api-version", "3.0"), ("to", "zh-Hant")
+    ]
+
+
+@pytest.mark.parametrize("attempt", ["success", "failure", "missing_key", "circuit_open"])
+def test_azure_batch_events_include_sanitized_target_count(attempt):
+    """Every emitted Azure batch event must expose its requested target count."""
+    logs = []
+    post = Mock(return_value=(
+        FakeResponse(payload=[{"translations": [
+            {"text": "private translation", "to": "fr"},
+            {"text": "private translation", "to": "ja"},
+        ]}]) if attempt == "success" else FakeResponse(status_code=500)
+    ))
+    chain = TranslationProviderChain(
+        make_settings(
+            provider_order=("azure",),
+            azure_key=None if attempt == "missing_key" else "test-key",
+        ),
+        post=post,
+        logger=lambda message, **fields: logs.append((message, fields)),
+    )
+    if attempt == "circuit_open":
+        for _ in range(3):
+            chain._circuit.record_failure()
+
+    chain.translate_many("private phrase", "auto", ["fr", "ja", "fr"])
+
+    assert len(logs) == 1
+    assert logs[0][1]["target_count"] == 2
+    assert logs[0][1]["dest"] == "fr,ja"
+    for private_value in ("private phrase", "private translation", "test-key"):
+        assert private_value not in repr(logs)
 
 
 def test_failed_eight_target_azure_batch_counts_as_one_circuit_failure():

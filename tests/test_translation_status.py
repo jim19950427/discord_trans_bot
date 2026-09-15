@@ -48,9 +48,21 @@ def test_translation_status_embed_allowlists_healthy_health_fields():
     assert "42 ms" in _embed_text(bot_module._format_translation_status(_healthy_status()))
     assert "3" in _embed_text(bot_module._format_translation_status(_healthy_status()))
     output = _embed_text(bot_module._format_translation_status(_healthy_status()))
+    assert "en、ja、ko、zt" in output
     assert "azure-key-should-never-appear" not in output
     assert "webhook-secret" not in output
     assert "private source text" not in output
+
+
+def test_translation_status_shows_partial_response_fallback_reason():
+    """A sanitized partial fallback must remain visible in the operational status."""
+    status = _healthy_status()
+    status["fallback"] = {"last_at": 1_700_000_010, "reason": "partial_response"}
+
+    output = _embed_text(bot_module._format_translation_status(status))
+
+    assert "partial_response" in output
+    assert "<t:1700000010:R>" in output
 
 
 def test_translation_status_embed_handles_unhealthy_and_empty_history():

@@ -86,6 +86,7 @@ def save_clusters(clusters: dict) -> None:
             "avatar_url":  cluster.get("avatar_url", ""),
             "source_ch":   cluster["source_ch"],
             "source_lang": cluster["source_lang"],
+            "raw_forward": cluster.get("raw_forward", False),
         }
         for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
             if opt_key in cluster:
@@ -113,6 +114,7 @@ def load_clusters() -> dict:
                 "avatar_url":  entry.get("avatar_url", ""),
                 "source_ch":   int(entry["source_ch"]),
                 "source_lang": entry["source_lang"],
+                "raw_forward": entry.get("raw_forward", False),
             }
             for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
                 if opt_key in entry:
