@@ -16,6 +16,7 @@ from translator import (
     translate_text_nocache,
     translate_text_with_status,
     translate_many_with_status,
+    get_translation_status,
     normalize_lang,
     has_translatable_content,
     log_event,
@@ -1323,6 +1324,141 @@ async def prefix_listlang(ctx: commands.Context):
 # Slash commands
 # ---------------------------------------------------------------------------
 
+_STATUS_UNAVAILABLE = "尚無資料"
+_SAFE_STATUS_REASONS = frozenset({
+    "request_error", "invalid_json", "invalid_response", "circuit_open",
+    "azure_failed", "libretranslate_failed", "missing_key", "empty_response",
+})
+_SAFE_CIRCUIT_STATES = frozenset({"closed", "open", "half_open"})
+
+
+def _status_timestamp(value) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"<t:{int(value)}:R>"
+    return _STATUS_UNAVAILABLE
+
+
+def _status_number(value, suffix: str = "") -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{int(value)}{suffix}"
+    return _STATUS_UNAVAILABLE
+
+
+def _status_reason(value) -> str:
+    if isinstance(value, str):
+        if value in _SAFE_STATUS_REASONS:
+            return value
+        if (
+            value.startswith("http_")
+            and value[5:].isdigit()
+            and 100 <= int(value[5:]) <= 599
+        ):
+            return value
+    return _STATUS_UNAVAILABLE
+
+
+def _status_languages(value) -> str:
+    if not isinstance(value, list):
+        return _STATUS_UNAVAILABLE
+    languages = [
+        language for language in value
+        if isinstance(language, str)
+        and language.replace("-", "").replace("_", "").isalnum()
+        and len(language) <= 20
+    ]
+    return "、".join(languages) if languages else _STATUS_UNAVAILABLE
+
+
+def _provider_last_result(provider: dict) -> str:
+    success_at = provider.get("last_success_at")
+    failure_at = provider.get("last_failure_at")
+    if isinstance(success_at, (int, float)) and not isinstance(success_at, bool) and (
+        not isinstance(failure_at, (int, float)) or isinstance(failure_at, bool)
+        or success_at >= failure_at
+    ):
+        return f"成功（{_status_timestamp(success_at)}）"
+    if isinstance(failure_at, (int, float)) and not isinstance(failure_at, bool):
+        return (
+            f"失敗（{_status_timestamp(failure_at)}；"
+            f"{_status_reason(provider.get('last_failure_reason'))}）"
+        )
+    return _STATUS_UNAVAILABLE
+
+
+def _format_translation_status(status: dict) -> discord.Embed:
+    """Render only the health data deliberately approved for the status command."""
+    if not isinstance(status, dict):
+        status = {}
+    azure = status.get("azure") if isinstance(status.get("azure"), dict) else {}
+    libretranslate = (
+        status.get("libretranslate")
+        if isinstance(status.get("libretranslate"), dict)
+        else {}
+    )
+    fallback = status.get("fallback") if isinstance(status.get("fallback"), dict) else {}
+    probe = (
+        status.get("libretranslate_probe")
+        if isinstance(status.get("libretranslate_probe"), dict)
+        else None
+    )
+
+    circuit_state = azure.get("circuit_state")
+    circuit = (
+        circuit_state
+        if isinstance(circuit_state, str) and circuit_state in _SAFE_CIRCUIT_STATES
+        else _STATUS_UNAVAILABLE
+    )
+    azure_value = "\n".join((
+        f"設定：{'已設定' if azure.get('configured') is True else '未設定'}",
+        f"熔斷器：{circuit}",
+        f"最近結果：{_provider_last_result(azure)}",
+        f"最近延遲：{_status_number(azure.get('last_latency_ms'), ' ms')}",
+        f"最近目標數：{_status_number(azure.get('last_target_count'))}",
+    ))
+
+    if probe is None:
+        libre_result = "未探測（被動結果）"
+        libre_languages = _STATUS_UNAVAILABLE
+    else:
+        probe_latency = _status_number(probe.get("latency_ms"), " ms")
+        if probe.get("healthy") is True:
+            libre_result = f"健康（{probe_latency}）"
+        else:
+            libre_result = f"失敗（{probe_latency}；{_status_reason(probe.get('failure_reason'))}）"
+        libre_languages = _status_languages(probe.get("languages"))
+    libre_value = "\n".join((
+        f"探測：{libre_result}",
+        f"被動結果：{_provider_last_result(libretranslate)}",
+        f"已載入語言：{libre_languages}",
+    ))
+
+    fallback_value = "\n".join((
+        f"最近備援：{_status_timestamp(fallback.get('last_at'))}",
+        f"原因：{_status_reason(fallback.get('reason'))}",
+    ))
+
+    embed = discord.Embed(title="翻譯服務狀態", color=discord.Color.blue())
+    embed.add_field(name="Azure Translator", value=azure_value, inline=False)
+    embed.add_field(name="LibreTranslate", value=libre_value, inline=False)
+    embed.add_field(name="最近備援", value=fallback_value, inline=False)
+    return embed
+
+
+@bot.tree.command(name="translation-status", description="查看翻譯服務健康狀態")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_translation_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        status = await asyncio.to_thread(get_translation_status, probe_libre=True)
+        embed = _format_translation_status(status)
+    except Exception:
+        embed = discord.Embed(
+            title="翻譯服務狀態",
+            description="暫時無法取得狀態，翻譯服務不受此查詢影響。",
+            color=discord.Color.orange(),
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="addlang", description="設定語言頻道")
 @app_commands.describe(
     lang_code="語言代碼（例如 zh-TW, en, ja, ko）",
@@ -1728,6 +1864,7 @@ async def translate_context_menu(interaction: discord.Interaction, message: disc
 
 
 # Slash command error handlers
+@slash_translation_status.error
 @slash_addlang.error
 @slash_removelang.error
 @slash_addterm.error

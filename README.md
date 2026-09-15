@@ -47,6 +47,8 @@ B 在 #english 輸入「Good morning」
 
 頻道的語言設定代表該頻道要顯示的**目標語言**，不限制輸入語言。你可以在任何已設定的語言頻道輸入中文、英文、日文等內容；系統會自動辨識來源，再翻譯到其他頻道。各頻道仍應設定為實際目標語言（例如 `zh-TW`、`en`、`ja`），不需設定成 `auto`。
 
+每次轉發會依提供者可接受的目標語言，將同一段原文的多個目標語言合併為批次；Azure 對每個相容的提供者輸入群組只呼叫一次，再把各結果送往對應的**目標頻道**。一個 Azure 批次只計入一次斷路器結果；若 Azure 無法處理整批，LibreTranslate 只補譯尚未取得結果的目標。Azure 可直接使用其支援的新增語言代碼；若新語言也必須能在 NAS 備援，部署者必須同時更新 `docker-compose.yml` 的 `LT_LOAD_ONLY`。
+
 ---
 
 ## 二、頻道管理指令
@@ -56,6 +58,9 @@ B 在 #english 輸入「Good morning」
 | `/addlang lang_code:<代碼> [channel:#頻道] [group:<群組>]` | `!addlang <代碼> [#頻道] [群組]` | 管理頻道 | 將頻道設為語言頻道（省略頻道則為目前頻道） |
 | `/removelang [channel:#頻道]` | `!removelang [#頻道]` | 管理頻道 | 取消語言頻道設定並刪除對應 Webhook |
 | `/listlang` | `!listlang` | 所有人 | 列出目前所有語言頻道（依群組分組顯示） |
+| `/translation-status` | — | 管理頻道 | 僅呼叫者可見的 Azure／LibreTranslate 健康狀態 |
+
+`/translation-status` 會顯示 Azure 設定、斷路器與最近批次結果，LibreTranslate 的受限 `/languages` 探測，以及最近備援時間與原因。輸出固定只含這些健康欄位，不會顯示金鑰、Webhook URL、訊息原文或翻譯內容。
 
 ### 語言頻道群組
 

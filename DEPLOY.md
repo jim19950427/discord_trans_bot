@@ -128,7 +128,7 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 ## 四、Azure 與 NAS LibreTranslate 備援
 
 1. 只在 NAS 的 `/volume1/docker/discord-trans-bot/.env` 設定 Azure Key 1：`AZURE_TRANSLATOR_KEY=...`；`AZURE_TRANSLATOR_REGION=eastasia`，endpoint 使用 `https://api.cognitive.microsofttranslator.com`。不要把真實 key 貼進終端機參數、shell history 或聊天。
-2. 上傳新版後執行 `./deploy.sh --with-deps`，再到 Container Manager 重新建置 `discord-trans-bot` image，因為 Python 依賴已變更。
+2. 一般程式更新只需在本機執行 `./deploy.sh`（code-only）；它只傳送掛載的原始碼，**不會讀取、上傳或覆寫 NAS `.env`**。只有 Docker 設定或 Python 依賴變更時，才使用 `./deploy.sh --with-deps` 並到 Container Manager 重建 image。
 3. 啟動 LibreTranslate。第一次下載模型可能需要數分鐘，health status 顯示 `starting` 是正常的；其 port 不會發布到 NAS 外部。
 4. 以 SSH 驗證：
 
@@ -146,3 +146,5 @@ python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.json"
 
 6. 要測試備援時，暫時把 NAS `.env` 的 key 改為字面值 `invalid-test-key`，只重建 bot container，送一段未快取文字，確認 `provider=libretranslate`；隨即還原 Key 1 並再次重建 bot。切勿將真 key 放在命令列。
 7. 輪替金鑰時先讓 bot 改用 Key 2、重建並確認 Azure 成功，最後才在 Azure portal 重新產生 Key 1。
+8. 要新增 LibreTranslate 備援語言時，必須將相應 Libre 語言代碼加入 `docker-compose.yml` 的 `LT_LOAD_ONLY`，以 `./deploy.sh --with-deps` 上傳並重建 image；Azure 支援的新語言本身不需要修改這份清單。
+9. 以有「管理頻道」權限的帳號執行 `/translation-status`。回覆應只對該使用者可見，並顯示 Azure 批次健康、Libre `/languages` 探測與最近備援資訊；畫面不得包含金鑰、Webhook URL、原文或譯文。

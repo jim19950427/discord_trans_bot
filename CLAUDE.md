@@ -70,6 +70,10 @@ Order matters and each stage exists because of a specific failure mode observed 
 
 `translator.py` owns text transformation and cache; `translation_providers.py` owns all external translation. `bot.py` must not import provider implementations. Azure is primary; internal LibreTranslate is the fallback. `zh-TW` maps only at provider boundaries: Azure `zh-Hant`, LibreTranslate `zt`. Equal non-empty output is provider success. The in-memory breaker is thread-safe and permits one half-open probe; LibreTranslate concurrency is two and its port is never published. Provider errors are sanitized: keys and webhook URLs are forbidden in logs. Every mounted Python source file must be present in both the source watcher and deploy list.
 
+Batch fan-out groups compatible destination targets into one provider call: one Azure batch is one circuit result, and fallback receives only unresolved targets. Channel configuration is destination-only; user input remains `auto` source. Azure languages are extensible through channel configuration, but every language expected to work during NAS fallback must also be added to `LT_LOAD_ONLY` in `docker-compose.yml`.
+
+`/translation-status` requires Manage Channels and always defers/follows up ephemerally. It uses only `translator.get_translation_status(probe_libre=True)` and `_format_translation_status()` must explicitly render its three approved health fields; never serialize arbitrary status keys or show credentials, webhook URLs, message content, or translations.
+
 Channel language settings are destination languages only. Every user-authored message, edit, thread name, retry, and context-menu translation uses source `auto`, so users may type any language in any configured channel. A successful non-empty result equal to the input is valid (for example English detected while targeting English) and must not be scheduled as a provider failure.
 
 Google's previous mobile-page scraper failed behind CAPTCHA/rate limits and could cache error pages. Keep that history only as a reason never to restore it to the runtime chain.
@@ -82,4 +86,4 @@ Google's previous mobile-page scraper failed behind CAPTCHA/rate limits and coul
 
 ### Hot-reload deployment
 
-`bot.py` starts a daemon thread (`_watch_source_files`) that polls every mounted Python source file and calls `os._exit(0)` (never `sys.exit`, which only unwinds the calling thread) when one changes. Docker's `restart: unless-stopped` policy then brings the container back up running the new code. `on_ready` also writes `/data/status.json` with a `last_start` timestamp for deployment verification.
+`bot.py` starts a daemon thread (`_watch_source_files`) that polls every mounted Python source file and calls `os._exit(0)` (never `sys.exit`, which only unwinds the calling thread) when one changes. Docker's `restart: unless-stopped` policy then brings the container back up running the new code. `on_ready` also writes `/data/status.json` with a `last_start` timestamp for deployment verification. `./deploy.sh` is code-only and must not read or overwrite the NAS `.env`; reserve `--with-deps` for deployment-configuration/dependency changes.
