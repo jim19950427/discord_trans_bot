@@ -76,7 +76,7 @@ Azure `type="translate_provider"` events include `target_count`, the number of d
 
 `/translation-status` requires Manage Channels and always defers/follows up ephemerally. It uses only `translator.get_translation_status(probe_libre=True)` and `_format_translation_status()` must explicitly render its three approved health fields; never serialize arbitrary status keys or show credentials, webhook URLs, message content, or translations.
 
-Channel language settings are destination languages only. Every user-authored message, edit, thread name, retry, and context-menu translation uses source `auto`, so users may type any language in any configured channel. A successful non-empty result equal to the input is valid (for example English detected while targeting English) and must not be scheduled as a provider failure.
+Channel language settings are destination languages only. Every user-authored message, edit, thread name, retry, and context-menu translation uses source `auto`, so users may type any language in any configured channel. A successful non-empty result equal to the input is valid when the provider detected the target language (for example English detected while targeting English). LibreTranslate equal-output responses detected as another language are `unchanged_response` failures: forward the original immediately, then retry once after 60 seconds.
 
 Google's previous mobile-page scraper failed behind CAPTCHA/rate limits and could cache error pages. Keep that history only as a reason never to restore it to the runtime chain.
 

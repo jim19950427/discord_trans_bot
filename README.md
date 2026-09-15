@@ -49,6 +49,8 @@ B 在 #english 輸入「Good morning」
 
 每次轉發會依提供者可接受的目標語言，將同一段原文的多個目標語言合併為批次；Azure 對每個相容的提供者輸入群組只呼叫一次，再把各結果送往對應的**目標頻道**。一個 Azure 批次只計入一次斷路器結果；若 Azure 無法處理整批，LibreTranslate 只補譯尚未取得結果的目標。Azure 可直接使用其支援的新增語言代碼；若新語言也必須能在 NAS 備援，部署者必須同時更新 `docker-compose.yml` 的 `LT_LOAD_ONLY`。
 
+若所有提供者都未取得可用譯文，Bot 會先把原文送到目標頻道，60 秒後只重試一次；重試成功時會編輯同一則訊息，仍失敗則保留原文。LibreTranslate 自動辨識為其他語言卻原樣回傳的結果，也會依此流程重試。
+
 Azure 的安全提供者事件包含 `target_count`（該批去重後的目標鍵數）；未快取且可共用輸入的三語言翻譯應有一筆 Azure 事件，`target_count=3`。查詢方式與 NAS 驗收步驟見 [部署說明](DEPLOY.md#四azure-與-nas-libretranslate-備援)。更新 `LT_LOAD_ONLY` 後須重新建立 LibreTranslate container，並確認 `/languages` 已載入新增語言。
 
 ---

@@ -438,7 +438,19 @@ class TranslationProviderChain:
             payload = response.json()
         except (TypeError, ValueError) as exc:
             raise ProviderError("invalid_json", type(exc).__name__) from exc
-        return _response_text(payload, "libretranslate")
+        translated = _response_text(payload, "libretranslate")
+        if source.lower() == "auto" and translated.strip() == text.strip():
+            detected = payload.get("detectedLanguage")
+            detected_code = (
+                detected.get("language") if isinstance(detected, dict) else None
+            )
+            target_code = map_language(target, "libretranslate")
+            if (
+                not isinstance(detected_code, str)
+                or detected_code.lower() != target_code.lower()
+            ):
+                raise ProviderError("unchanged_response")
+        return translated
 
     def translate_many(
         self, text: str, source: str, targets: list[str]

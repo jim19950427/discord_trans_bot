@@ -437,6 +437,29 @@ def test_provider_order_can_prefer_libretranslate():
     assert post.call_args.args[0] == "http://libretranslate:5000/translate"
 
 
+@pytest.mark.parametrize(
+    ("text", "detected_language", "expected"),
+    [
+        ("那吃 zako", "zt", None),
+        ("Already English", "en", "Already English"),
+    ],
+)
+def test_libre_equal_output_depends_on_detected_language(
+    text, detected_language, expected
+):
+    post = Mock(return_value=FakeResponse(payload={
+        "detectedLanguage": {"confidence": 90.0, "language": detected_language},
+        "translatedText": text,
+    }))
+    settings = make_settings(provider_order=("libretranslate",))
+
+    result = TranslationProviderChain(settings, post=post).translate(
+        text, "auto", "en"
+    )
+
+    assert result == expected
+
+
 def test_missing_azure_key_skips_to_libretranslate():
     logs = []
     post = Mock(return_value=FakeResponse(payload={"translatedText": "bonjour"}))
