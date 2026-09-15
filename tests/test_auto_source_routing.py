@@ -24,16 +24,31 @@ def _message(content: str = "Hello from a Chinese-labelled channel"):
     )
 
 
-def test_message_from_fixed_language_channel_uses_auto_source(monkeypatch):
-    """Changing a channel label back to zh-TW must not disable source detection."""
-    observed_sources = []
+def test_on_message_batches_once_and_routes_by_language_key(monkeypatch):
+    """Fan-out must deliver by canonical language key, not provider result order."""
+    batch_calls = []
+    deliveries = []
 
-    async def fake_translate_and_send(text, source, target, *args, **kwargs):
-        observed_sources.append(source)
-        return 8001, "테스트"
+    def fake_translate_many(text, targets, glossary=None, substitutions=None):
+        batch_calls.append((text, targets, glossary, substitutions))
+        # Deliberately different from channel order: ja, en, ko.
+        return {
+            "ja": translator.TranslationOutcome("日本語", True),
+            "en": translator.TranslationOutcome("Hello", True),
+            "ko": translator.TranslationOutcome("한국어", True),
+        }
+
+    async def fake_send_pretranslated(outcome, target, webhook_url, *args, **kwargs):
+        deliveries.append((target, webhook_url, outcome.text))
+        return bot_module._ForwardResult(8001, outcome.text or "", outcome.provider_succeeded)
+
+    async def legacy_translate_and_send(*args, **kwargs):
+        raise AssertionError("on_message must batch before it fans out")
 
     monkeypatch.setattr(bot_module.bot, "process_commands", AsyncMock())
-    monkeypatch.setattr(bot_module, "_translate_and_send", fake_translate_and_send)
+    monkeypatch.setattr(bot_module, "translate_many_with_status", fake_translate_many, raising=False)
+    monkeypatch.setattr(bot_module, "_send_pretranslated", fake_send_pretranslated, raising=False)
+    monkeypatch.setattr(bot_module, "_translate_and_send", legacy_translate_and_send)
     monkeypatch.setattr(bot_module, "_store_cluster", lambda cluster: None)
     monkeypatch.setattr(bot_module, "get_guild_glossary", lambda *args: {})
     monkeypatch.setattr(bot_module, "get_guild_substitutions", lambda *args: {})
@@ -43,14 +58,23 @@ def test_message_from_fixed_language_channel_uses_auto_source(monkeypatch):
         {
             7: {
                 101: {"lang": "zh-TW", "webhook_url": "source", "group": "default"},
-                202: {"lang": "ko", "webhook_url": "target", "group": "default"},
+                202: {"lang": "ko", "webhook_url": "ko-hook", "group": "default"},
+                203: {"lang": "en", "webhook_url": "en-hook", "group": "default"},
+                204: {"lang": "ja", "webhook_url": "ja-hook", "group": "default"},
             }
         },
     )
 
     asyncio.run(bot_module.on_message(_message()))
 
-    assert observed_sources == ["auto"]
+    assert batch_calls == [
+        ("Hello from a Chinese-labelled channel", ["ko", "en", "ja"], {}, {})
+    ]
+    assert deliveries == [
+        ("ko", "ko-hook", "한국어"),
+        ("en", "en-hook", "Hello"),
+        ("ja", "ja-hook", "日本語"),
+    ]
 
 
 def test_successful_equal_output_is_forwarded_without_failure_retry(monkeypatch):
@@ -61,7 +85,7 @@ def test_successful_equal_output_is_forwarded_without_failure_retry(monkeypatch)
     class SuccessfulForward(tuple):
         translation_succeeded = True
 
-    async def fake_translate_and_send(*args, **kwargs):
+    async def fake_send_pretranslated(*args, **kwargs):
         return SuccessfulForward((8002, content))
 
     def fake_create_task(coro):
@@ -69,7 +93,12 @@ def test_successful_equal_output_is_forwarded_without_failure_retry(monkeypatch)
         coro.close()
 
     monkeypatch.setattr(bot_module.bot, "process_commands", AsyncMock())
-    monkeypatch.setattr(bot_module, "_translate_and_send", fake_translate_and_send)
+    monkeypatch.setattr(
+        bot_module,
+        "translate_many_with_status",
+        lambda *args, **kwargs: {"en": translator.TranslationOutcome(content, True)},
+    )
+    monkeypatch.setattr(bot_module, "_send_pretranslated", fake_send_pretranslated)
     monkeypatch.setattr(bot_module, "_store_cluster", lambda cluster: None)
     monkeypatch.setattr(bot_module, "get_guild_glossary", lambda *args: {})
     monkeypatch.setattr(bot_module, "get_guild_substitutions", lambda *args: {})
