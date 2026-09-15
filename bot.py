@@ -851,7 +851,7 @@ async def _retry_translate(
     ch_id: int,
     cluster: dict,
     glossary: dict | None = None,
-    delay: int = 10,
+    delay: int = 60,
 ) -> None:
     await asyncio.sleep(delay)
     outcome = await asyncio.to_thread(

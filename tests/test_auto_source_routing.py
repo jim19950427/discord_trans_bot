@@ -187,6 +187,34 @@ def test_forward_result_preserves_provider_success(monkeypatch):
     assert result.translation_succeeded is True
 
 
+def test_failed_translation_retry_waits_one_minute_by_default(monkeypatch):
+    waited = []
+
+    async def fake_sleep(delay):
+        waited.append(delay)
+
+    monkeypatch.setattr(bot_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        bot_module,
+        "translate_text_with_status",
+        lambda *args, **kwargs: translator.TranslationOutcome(None, False),
+    )
+
+    asyncio.run(
+        bot_module._retry_translate(
+            "需要稍後重試",
+            "auto",
+            "ko",
+            "https://example.invalid/webhook",
+            4321,
+            202,
+            {"prefixes": {}, "contents": {}},
+        )
+    )
+
+    assert waited == [60]
+
+
 def test_retry_accepts_successful_equal_output(monkeypatch):
     """An equality check in retry would keep reporting a recovered call as failed."""
     content = "Already English"
