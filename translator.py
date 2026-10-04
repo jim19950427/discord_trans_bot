@@ -126,11 +126,17 @@ def has_translatable_content(text: str) -> bool:
 
 def _init_log_count(path: str) -> int:
     """Count existing lines once per path. If a crash left the last line
-    unterminated, close it so the next append doesn't fuse two entries."""
+    unterminated, close it so the next append doesn't fuse two entries.
+    A legacy JSON-array log is moved aside to <path>.legacy."""
     try:
         with open(path, "rb") as f:
             data = f.read()
     except FileNotFoundError:
+        return 0
+    if data.lstrip().startswith(b"["):
+        # Legacy single JSON-array log (pre-JSONL, e.g. BOT_LOG_FILE still
+        # pointing at bot_log.json): keep it aside rather than mixing formats.
+        os.replace(path, path + ".legacy")
         return 0
     if data and not data.endswith(b"\n"):
         with open(path, "ab") as f:

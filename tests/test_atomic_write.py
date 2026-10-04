@@ -81,3 +81,23 @@ def test_channel_pins_round_trip_sorted(tmp_path, monkeypatch):
     monkeypatch.setattr(glossary, "CHANNEL_PINS_FILE", str(tmp_path / "pins.json"))
     glossary.save_channel_pins({5: {30, 10, 20}})
     assert glossary.load_channel_pins() == {5: {10, 20, 30}}
+
+
+def test_cleanup_stale_tmp_removes_only_orphaned_temp_files(tmp_path):
+    data = tmp_path / "msg_clusters.json"
+    data.write_text("{}")
+    orphan = tmp_path / "msg_clusters.json.123.456.tmp"
+    orphan.write_text("half")
+    unrelated = tmp_path / "notes.tmp"
+    unrelated.write_text("keep")
+    other_data = tmp_path / "glossary.json.9.9.tmp"
+    other_data.write_text("not in the list")
+
+    assert config.cleanup_stale_tmp([str(data)]) == 1
+
+    assert not orphan.exists()
+    assert data.exists() and unrelated.exists() and other_data.exists()
+
+
+def test_cleanup_stale_tmp_tolerates_missing_directory(tmp_path):
+    assert config.cleanup_stale_tmp([str(tmp_path / "nope" / "x.json")]) == 0

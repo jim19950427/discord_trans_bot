@@ -21,7 +21,10 @@ from translator import (
     has_translatable_content,
     log_event,
 )
-from config import atomic_write_json, load_channel_config, save_channel_config
+from config import (
+    CONFIG_FILE, atomic_write_json, cleanup_stale_tmp,
+    load_channel_config, save_channel_config,
+)
 from glossary import (
     load_glossary, save_glossary, get_guild_glossary,
     load_substitutions, save_substitutions, get_guild_substitutions,
@@ -34,6 +37,18 @@ from glossary import (
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# Remove temp files from atomic writes interrupted by a crash / hot-reload.
+# Must run at import, before the persist loop or log threads can write.
+import glossary as _glossary_module
+import translator as _translator_module
+cleanup_stale_tmp([
+    CONFIG_FILE, _translator_module.LOG_FILE,
+    os.environ.get("STATUS_FILE", "/data/status.json"),
+    _glossary_module.GLOSSARY_FILE, _glossary_module.SUBSTITUTIONS_FILE,
+    _glossary_module.USER_LANGS_FILE, _glossary_module.CLUSTERS_FILE,
+    _glossary_module.THREAD_CLUSTERS_FILE, _glossary_module.CHANNEL_PINS_FILE,
+])
 
 # ── Hot-reload file watcher ────────────────────────────────────────────────
 # Polls the mtime of all source files every 10 s; calls os._exit(0) on any

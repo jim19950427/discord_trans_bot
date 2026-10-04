@@ -1,6 +1,8 @@
+import glob
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 
@@ -53,6 +55,26 @@ def atomic_write_json(
         with _digest_lock:
             _last_digest[key] = digest
     return True
+
+
+_TMP_SUFFIX_RE = re.compile(r"\.\d+\.\d+\.tmp$")
+
+
+def cleanup_stale_tmp(data_paths) -> int:
+    """Delete temp files left by atomic writes that were cut off by a crash or
+    the hot-reload os._exit. Call once at process start, before any writer
+    thread exists — a live writer's temp file would otherwise be removed."""
+    removed = 0
+    for data_path in data_paths:
+        data_path = os.path.abspath(data_path)
+        for tmp in glob.glob(glob.escape(data_path) + ".*.tmp"):
+            if _TMP_SUFFIX_RE.search(tmp[len(data_path):]):
+                try:
+                    os.remove(tmp)
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
 
 
 def quarantine_corrupt(path: str) -> None:

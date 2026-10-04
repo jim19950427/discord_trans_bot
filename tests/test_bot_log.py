@@ -94,3 +94,15 @@ def test_log_trim_keeps_newest_entries_and_leaves_no_temp_file(tmp_path, monkeyp
     assert 10 <= len(entries) <= 11  # trimmed at cap + 10%
     assert entries[-1]["message"] == "event-39"
     assert [p.name for p in tmp_path.iterdir()] == ["bot_log.jsonl"]
+
+
+def test_legacy_json_array_log_is_moved_aside_not_mixed(tmp_path, monkeypatch):
+    log_file = tmp_path / "bot_log.json"
+    legacy = '[{"message": "old"}]'
+    log_file.write_text(legacy)
+    monkeypatch.setattr(translator, "LOG_FILE", str(log_file))
+
+    translator.log_event("new")
+
+    assert (tmp_path / "bot_log.json.legacy").read_text() == legacy
+    assert [e["message"] for e in _read_log(log_file)] == ["new"]
