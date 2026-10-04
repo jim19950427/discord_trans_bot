@@ -21,7 +21,7 @@ from translator import (
     has_translatable_content,
     log_event,
 )
-from config import load_channel_config, save_channel_config
+from config import atomic_write_json, load_channel_config, save_channel_config
 from glossary import (
     load_glossary, save_glossary, get_guild_glossary,
     load_substitutions, save_substitutions, get_guild_substitutions,
@@ -237,9 +237,7 @@ async def on_ready():
     # Write a startup marker so deploy verification can confirm restart via SSH.
     _status_file = os.environ.get("STATUS_FILE", "/data/status.json")
     try:
-        os.makedirs(os.path.dirname(_status_file) or ".", exist_ok=True)
-        with open(_status_file, "w") as _f:
-            json.dump({"last_start": time.strftime("%Y-%m-%d %H:%M:%S")}, _f)
+        atomic_write_json(_status_file, {"last_start": time.strftime("%Y-%m-%d %H:%M:%S")})
     except Exception as _e:
         print(f"[status write failed] {_e}")
 

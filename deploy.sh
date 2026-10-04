@@ -12,8 +12,9 @@
 set -e
 
 # ── 設定 ──────────────────────────────────────────────
-NAS="jim@192.168.1.11"
-DEST="/volume1/docker/discord-trans-bot"
+# 可用環境變數覆寫，例如走 Tailscale：DEPLOY_NAS=jim@my-nas ./deploy.sh
+NAS="${DEPLOY_NAS:-jim@192.168.1.11}"
+DEST="${DEPLOY_DEST:-/volume1/docker/discord-trans-bot}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
 CODE_FILES=(bot.py translator.py translation_providers.py config.py glossary.py)
@@ -26,15 +27,31 @@ info()    { echo -e "${CYAN}${BOLD}[INFO]${RESET}  $*"; }
 warn()    { echo -e "${YELLOW}${BOLD}[WARN]${RESET}  $*"; }
 error()   { echo -e "${RED}${BOLD}[ERR ]${RESET}  $*"; exit 1; }
 
-# 上傳單一檔案（SSH pipe）
-upload() {
-    local f="$1"
+SSH_OPTS=(-o ConnectTimeout=8 -o BatchMode=yes)
+
+# 階段 1：上傳到 <檔名>.new 並驗證位元組數。
+# 傳到一半斷線只會留下 .new，不會動到正在跑的程式（watcher 不監看 .new）。
+stage() {
+    local f="$1" size remote_size
     [ -f "${DIR}/${f}" ] || error "找不到檔案：${f}"
-    if cat "${DIR}/${f}" | ssh "$NAS" "cat > '${DEST}/${f}'"; then
-        success "${f}  →  ${NAS}:${DEST}/${f}"
-    else
-        error "上傳失敗：${f}"
-    fi
+    size=$(wc -c < "${DIR}/${f}" | tr -d ' ')
+    cat "${DIR}/${f}" | ssh "${SSH_OPTS[@]}" "$NAS" "cat > '${DEST}/${f}.new'" \
+        || error "上傳失敗：${f}"
+    remote_size=$(ssh "${SSH_OPTS[@]}" "$NAS" "wc -c < '${DEST}/${f}.new'" | tr -d ' ')
+    [ "$size" = "$remote_size" ] || error "${f} 大小不符（本機 ${size}，NAS ${remote_size}），未套用"
+    success "${f}  已上傳並驗證（${size} bytes）"
+}
+
+# 階段 2：在 NAS 上用 cat 原地覆蓋（NAS 本機複製，毫秒級）。
+# 不能用 mv：docker-compose 是單檔 bind mount，mv 會換 inode，
+# 容器會一直看到舊檔，熱重載就失效。所有檔案在同一個 ssh 內一次套用，
+# 避免 watcher 在多檔上傳之間重啟而載入新舊混合的版本。
+apply_all() {
+    local cmd="set -e;" f
+    for f in "${FILES[@]}"; do
+        cmd+=" cat '${DEST}/${f}.new' > '${DEST}/${f}' && rm -f '${DEST}/${f}.new';"
+    done
+    ssh "${SSH_OPTS[@]}" "$NAS" "$cmd" || error "套用失敗（.new 暫存檔仍在 NAS 上）"
 }
 
 echo -e "\n${BOLD}${CYAN}🚀  Discord Trans Bot — 部署到 DSM${RESET}\n"
@@ -47,23 +64,42 @@ if [ "$1" == "--with-deps" ]; then
     FILES=("${CODE_FILES[@]}" "${DEP_FILES[@]}")
     info "模式：程式碼 + 部署設定（--with-deps）"
 else
-    info "模式：只上傳程式碼（bot.py translator.py config.py glossary.py）"
+    info "模式：只上傳程式碼（${CODE_FILES[*]}）"
 fi
 
 # 連線測試
 info "測試 SSH 連線 ${NAS} ..."
-ssh -o ConnectTimeout=8 "$NAS" "test -d '${DEST}'" \
+ssh "${SSH_OPTS[@]}" "$NAS" "test -d '${DEST}'" \
     || error "無法連線或找不到目錄 ${DEST}（確認 SSH key 與路徑）"
 success "連線正常，目標目錄存在"
 
-echo ""
-for f in "${FILES[@]}"; do
-    upload "$f"
-done
+STATUS_FILE="${DEST}/data/status.json"
+read_status() { ssh "${SSH_OPTS[@]}" "$NAS" "cat '${STATUS_FILE}' 2>/dev/null" || true; }
+BEFORE="$(read_status)"
 
 echo ""
-success "上傳完成"
-info  "容器 file watcher 會在 ~10 秒內偵測變更並自動重啟"
+for f in "${FILES[@]}"; do
+    stage "$f"
+done
+apply_all
+success "已套用 ${#FILES[@]} 個檔案"
+info  "等待容器 file watcher 偵測變更並重啟（最多 60 秒）..."
+
+# 部署後驗證：status.json 的 last_start 變了，才代表真的重啟
+RESTARTED=0
+for _ in $(seq 1 12); do
+    sleep 5
+    AFTER="$(read_status)"
+    if [ -n "$AFTER" ] && [ "$AFTER" != "$BEFORE" ]; then
+        RESTARTED=1
+        break
+    fi
+done
+if [ "$RESTARTED" -eq 1 ]; then
+    success "容器已重啟：${AFTER}"
+else
+    warn "60 秒內沒看到 status.json 更新。請到 Container Manager 查看容器狀態與日誌。"
+fi
 
 if [ "$WITH_DEPS" -eq 1 ]; then
     echo ""

@@ -32,3 +32,28 @@ def test_runtime_dependency_uses_requests_not_deep_translator():
     requirements = (ROOT / "requirements.txt").read_text().lower()
     assert "requests>=" in requirements
     assert "deep-translator" not in requirements
+
+
+def test_runtime_dependencies_have_upper_bounds():
+    for line in (ROOT / "requirements.txt").read_text().splitlines():
+        if line.strip():
+            assert ",<" in line, f"unbounded dependency: {line}"
+
+
+def test_ci_runs_pytest_on_dockerfile_python():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/test.yml").read_text())
+    steps = workflow["jobs"]["pytest"]["steps"]
+    assert any(step.get("run") == "pytest -q" for step in steps)
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    assert "python:3.11" in dockerfile
+    setup = next(step for step in steps if "setup-python" in step.get("uses", ""))
+    assert setup["with"]["python-version"] == "3.11"
+
+
+def test_deploy_stages_then_swaps_in_place_and_verifies_restart():
+    deploy = (ROOT / "deploy.sh").read_text()
+    assert ".new" in deploy and "status.json" in deploy
+    # mv would swap the inode of single-file bind mounts and break hot reload
+    assert " mv " not in deploy
+    for module in ("config.py", "glossary.py", "translator.py", "bot.py"):
+        assert module in deploy

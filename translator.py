@@ -5,6 +5,7 @@ import time
 import threading
 from dataclasses import dataclass
 import diskcache
+from config import atomic_write_text
 from translation_providers import (
     ProviderSettings,
     TranslationProviderChain,
@@ -14,9 +15,11 @@ from translation_providers import (
 CACHE_DIR = os.getenv("TRANSLATE_CACHE_DIR", "/data/translate_cache")
 CACHE_SIZE_LIMIT = int(os.getenv("TRANSLATE_CACHE_SIZE_LIMIT", str(50 * 1024 * 1024)))
 
-LOG_FILE = os.getenv("BOT_LOG_FILE", "/data/bot_log.json")
+LOG_FILE = os.getenv("BOT_LOG_FILE", "/data/bot_log.jsonl")
 LOG_MAX_ENTRIES = int(os.getenv("BOT_LOG_MAX_ENTRIES", "5000"))
 _log_lock = threading.Lock()
+# Lines currently in each log file (path -> count), so appends stay O(1).
+_log_counts: dict[str, int] = {}
 
 _translate_cache: diskcache.Cache | None = None
 _provider_chain: TranslationProviderChain | None = None
@@ -121,11 +124,35 @@ def has_translatable_content(text: str) -> bool:
     return bool(_HAS_WORD_RE.search(text))
 
 
+def _init_log_count(path: str) -> int:
+    """Count existing lines once per path. If a crash left the last line
+    unterminated, close it so the next append doesn't fuse two entries."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return 0
+    if data and not data.endswith(b"\n"):
+        with open(path, "ab") as f:
+            f.write(b"\n")
+        data += b"\n"
+    return data.count(b"\n")
+
+
+def _trim_log(path: str) -> int:
+    with open(path, "r", encoding="utf-8") as f:
+        lines = f.readlines()[-LOG_MAX_ENTRIES:]
+    atomic_write_text(path, "".join(lines))
+    return len(lines)
+
+
 def log_event(message: str, **fields) -> None:
     """Print message to the console (unchanged, still visible in the DSM log
-    viewer) and also append a structured entry to a shared JSON log file,
-    capped at LOG_MAX_ENTRIES entries (oldest dropped first). Thread-safe —
-    bot events and translate calls both come from concurrent worker threads.
+    viewer) and also append a structured entry to a shared JSON-lines log file
+    (one JSON object per line), trimmed to the newest LOG_MAX_ENTRIES entries
+    once it grows 10% past the cap. Appending is O(1) — the file is never
+    re-read or rewritten per event. Thread-safe — bot events and translate
+    calls both come from concurrent worker threads.
     """
     print(message)
     entry = {
@@ -134,19 +161,20 @@ def log_event(message: str, **fields) -> None:
         "message": message,
         **fields,
     }
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
     with _log_lock:
         try:
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                entries = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            entries = []
-        entries.append(entry)
-        if len(entries) > LOG_MAX_ENTRIES:
-            entries = entries[-LOG_MAX_ENTRIES:]
-        try:
-            os.makedirs(os.path.dirname(LOG_FILE) or ".", exist_ok=True)
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                json.dump(entries, f, ensure_ascii=False)
+            path = LOG_FILE
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            count = _log_counts.get(path)
+            if count is None:
+                count = _init_log_count(path)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+            count += 1
+            if count > LOG_MAX_ENTRIES + max(1, LOG_MAX_ENTRIES // 10):
+                count = _trim_log(path)
+            _log_counts[path] = count
         except OSError as e:
             print(f"[log write failed] {e}")
 

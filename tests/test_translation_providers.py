@@ -654,3 +654,78 @@ def test_probe_libretranslate_reports_timeout_without_mutating_passive_health():
     assert probe["languages"] == []
     assert probe["failure_reason"] == "request_error"
     assert chain.status_snapshot() == before
+
+
+def _libre_only(**overrides):
+    return make_settings(
+        provider_order=("libretranslate",),
+        libretranslate_circuit_failure_threshold=2,
+        libretranslate_circuit_cooldown=30.0,
+        **overrides,
+    )
+
+
+def test_libretranslate_outage_opens_breaker_and_skips_remaining_targets():
+    post = Mock(return_value=FakeResponse(status_code=503))
+    logs = []
+    chain = TranslationProviderChain(
+        _libre_only(), post=post, logger=lambda m, **f: logs.append(f)
+    )
+
+    results = chain.translate_many("hello", "en", ["fr", "ja", "ko", "ru"])
+
+    assert results == {"fr": None, "ja": None, "ko": None, "ru": None}
+    assert post.call_count == 2  # breaker opened after 2 failures
+    assert any(f.get("fallback_reason") == "circuit_open" for f in logs)
+    assert chain.status_snapshot()["libretranslate"]["circuit_state"] == "open"
+
+
+def test_libretranslate_breaker_recovers_after_cooldown():
+    clock = FakeClock()
+    responses = [FakeResponse(status_code=503), FakeResponse(status_code=503)]
+    post = Mock(side_effect=lambda *a, **k: responses.pop(0) if responses else
+                FakeResponse(payload={"translatedText": "ok"}))
+    chain = TranslationProviderChain(_libre_only(), post=post, monotonic=clock)
+
+    assert chain.translate("a", "en", "fr") is None
+    assert chain.translate("b", "en", "fr") is None
+    assert chain.translate("c", "en", "fr") is None  # open: no request made
+    assert post.call_count == 2
+    clock.now += 31
+    assert chain.translate("d", "en", "fr") == "ok"
+    assert chain.status_snapshot()["libretranslate"]["circuit_state"] == "closed"
+
+
+def test_libretranslate_content_errors_do_not_trip_breaker():
+    post = Mock(return_value=FakeResponse(status_code=400))
+    chain = TranslationProviderChain(_libre_only(), post=post)
+
+    for _ in range(5):
+        chain.translate("hello", "en", "fr")
+
+    assert post.call_count == 5
+    assert chain.status_snapshot()["libretranslate"]["circuit_state"] == "closed"
+
+
+def test_default_transport_reuses_one_session_per_thread(monkeypatch):
+    sessions = []
+
+    class FakeSession:
+        def __init__(self):
+            sessions.append(self)
+            self.calls = 0
+
+        def post(self, *args, **kwargs):
+            self.calls += 1
+            return FakeResponse(payload={"translatedText": "ok"})
+
+    monkeypatch.setattr("translation_providers.requests.Session", FakeSession)
+    chain = TranslationProviderChain(make_settings(provider_order=("libretranslate",)))
+
+    chain.translate("a", "en", "fr")
+    chain.translate("b", "en", "fr")
+    assert len(sessions) == 1 and sessions[0].calls == 2
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(chain.translate, "c", "en", "fr").result()
+    assert len(sessions) == 2  # a different thread gets its own session

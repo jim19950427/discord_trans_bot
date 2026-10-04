@@ -77,7 +77,7 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 # MAX_CLUSTER_ENTRIES=2000            ← 追蹤訊息上限（預設 2000，超過時自動淘汰最舊的）
 # TRANSLATE_CACHE_DIR=/data/translate_cache   ← 翻譯快取目錄（預設值如左，已包含在 data volume 內，重啟不會消失）
 # TRANSLATE_CACHE_SIZE_LIMIT=52428800         ← 翻譯快取容量上限，單位 bytes（預設 50MB，超過時自動淘汰最少使用的項目）
-# BOT_LOG_FILE=/data/bot_log.json      ← 機器人運作紀錄檔（JSON），涵蓋翻譯呼叫與所有錯誤/事件訊息，方便除錯查詢
+# BOT_LOG_FILE=/data/bot_log.jsonl      ← 機器人運作紀錄檔（JSON Lines，每行一筆），涵蓋翻譯呼叫與所有錯誤/事件訊息，方便除錯查詢
 # BOT_LOG_MAX_ENTRIES=5000             ← 紀錄檔上限筆數（預設 5000，超過時自動淘汰最舊的紀錄）
 ```
 
@@ -141,7 +141,7 @@ sudo docker compose exec discord-trans-bot python -c "import requests; print([x[
 5. 用 Discord 傳送測試訊息驗證 Azure，並檢查已清除敏感資料的 provider event：
 
 ```bash
-python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.json"; rows=json.load(open(p)); print(*[({k:r.get(k) for k in ("time","provider","success","target_count","latency_ms","fallback_reason","circuit_state")}) for r in rows if r.get("type")=="translate_provider"][-10:], sep="\n")'
+python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.jsonl"; rows=[json.loads(l) for l in open(p) if l.strip()]; print(*[({k:r.get(k) for k in ("time","provider","success","target_count","latency_ms","fallback_reason","circuit_state")}) for r in rows if r.get("type")=="translate_provider"][-10:], sep="\n")'
 ```
 
    批次驗收時，從 `zh-TW` 頻道送出一段未快取的英文，目標設為 `en`、`ja`、`ko`，且不含會拆分輸入的詞彙表內容。預期英文照常送達，日文與韓文各送到正確頻道；上列查詢在此次測試時間應顯示一筆 `provider=azure`、`success=True`、`target_count=3` 的事件。一般情況下，每個相容且未快取的提供者輸入群組各有一筆 Azure 事件；`target_count` 是該批去重後的目標鍵數，不是頻道數。指向同一 Azure 代碼的別名共用一個 `to` 參數，但仍各算一個目標鍵。缺 key 或斷路器開啟時的略過事件也有此欄位，不代表實際送出 Azure 請求。

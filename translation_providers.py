@@ -67,6 +67,8 @@ class ProviderSettings:
     circuit_failure_threshold: int
     circuit_cooldown: float
     libretranslate_max_concurrency: int
+    libretranslate_circuit_failure_threshold: int = 3
+    libretranslate_circuit_cooldown: float = 30.0
 
     @classmethod
     def from_env(cls) -> "ProviderSettings":
@@ -109,6 +111,12 @@ class ProviderSettings:
             ),
             libretranslate_max_concurrency=int(
                 os.getenv("LIBRETRANSLATE_MAX_CONCURRENCY", "2")
+            ),
+            libretranslate_circuit_failure_threshold=int(
+                os.getenv("LIBRETRANSLATE_CIRCUIT_FAILURE_THRESHOLD", "3")
+            ),
+            libretranslate_circuit_cooldown=float(
+                os.getenv("LIBRETRANSLATE_CIRCUIT_COOLDOWN_SECONDS", "30")
             ),
         )
 
@@ -203,21 +211,30 @@ class TranslationProviderChain:
         self,
         settings: ProviderSettings,
         *,
-        post: Callable[..., Any] = requests.post,
-        get: Callable[..., Any] = requests.get,
+        post: Callable[..., Any] | None = None,
+        get: Callable[..., Any] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         logger: Callable[..., None] | None = None,
     ):
         self.settings = settings
-        self._post = post
-        self._get = get
+        # Default transport reuses one keep-alive requests.Session per thread
+        # (Session isn't guaranteed thread-safe) instead of a fresh TCP/TLS
+        # handshake on every call. Injected callables (tests) are used as-is.
+        self._local = threading.local()
+        self._post = post or self._session_post
+        self._get = get or self._session_get
         self._monotonic = monotonic
         self._wall_clock = wall_clock
         self._logger = logger
         self._circuit = CircuitBreaker(
             settings.circuit_failure_threshold,
             settings.circuit_cooldown,
+            monotonic=monotonic,
+        )
+        self._libre_circuit = CircuitBreaker(
+            settings.libretranslate_circuit_failure_threshold,
+            settings.libretranslate_circuit_cooldown,
             monotonic=monotonic,
         )
         self._libre_slots = threading.BoundedSemaphore(
@@ -238,6 +255,27 @@ class TranslationProviderChain:
             for provider in SUPPORTED_PROVIDERS
         }
         self._fallback = {"last_at": None, "reason": None}
+
+    def _session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = self._local.session = requests.Session()
+        return session
+
+    def _session_post(self, *args, **kwargs):
+        return self._session().post(*args, **kwargs)
+
+    def _session_get(self, *args, **kwargs):
+        return self._session().get(*args, **kwargs)
+
+    @staticmethod
+    def _is_outage(category: str) -> bool:
+        """Failures that mean the service is down/overloaded (worth tripping
+        the breaker), as opposed to content problems like unchanged_response."""
+        return (
+            category in ("request_error", "invalid_json")
+            or category.startswith("http_5")
+        )
 
     @staticmethod
     def _bounded_reason(reason: str) -> str:
@@ -281,6 +319,7 @@ class TranslationProviderChain:
             fallback = dict(self._fallback)
         snapshot["azure"]["configured"] = bool(self.settings.azure_key)
         snapshot["azure"]["circuit_state"] = self._circuit.state
+        snapshot["libretranslate"]["circuit_state"] = self._libre_circuit.state
         snapshot["fallback"] = fallback
         return snapshot
 
@@ -533,11 +572,34 @@ class TranslationProviderChain:
 
             if provider == "libretranslate":
                 for target in list(unresolved):
+                    allowed, libre_state, libre_generation = (
+                        self._libre_circuit.admit_request()
+                    )
+                    if not allowed:
+                        # Service is down/cold-starting: fail the rest of this
+                        # batch immediately instead of waiting out a timeout
+                        # per target. The bot's retry pass picks them up.
+                        self._record_fallback("circuit_open")
+                        self._emit(
+                            "libretranslate",
+                            source,
+                            ",".join(unresolved),
+                            success=False,
+                            latency_ms=0,
+                            target_count=len(unresolved),
+                            fallback_reason="circuit_open",
+                            circuit_state=libre_state,
+                        )
+                        break
                     started = self._monotonic()
                     try:
                         result = self._libretranslate_translate(text, source, target)
                     except ProviderError as error:
                         latency_ms = int((self._monotonic() - started) * 1000)
+                        if self._is_outage(error.category):
+                            self._libre_circuit.record_failure(libre_generation)
+                        else:
+                            self._libre_circuit.record_success(libre_generation)
                         self._record_provider_attempt(
                             "libretranslate",
                             success=False,
@@ -554,10 +616,11 @@ class TranslationProviderChain:
                             latency_ms=latency_ms,
                             fallback_reason=error.category,
                             error_detail=error.detail or None,
-                            circuit_state=self._circuit.state,
+                            circuit_state=self._libre_circuit.state,
                         )
                         continue
                     latency_ms = int((self._monotonic() - started) * 1000)
+                    self._libre_circuit.record_success(libre_generation)
                     self._record_provider_attempt(
                         "libretranslate",
                         success=True,
@@ -571,7 +634,7 @@ class TranslationProviderChain:
                         success=True,
                         latency_ms=latency_ms,
                         fallback_reason=None,
-                        circuit_state=self._circuit.state,
+                        circuit_state=self._libre_circuit.state,
                     )
                     results[target] = result
                     unresolved.remove(target)
