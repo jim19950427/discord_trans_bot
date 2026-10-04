@@ -163,3 +163,35 @@ def load_channel_pins() -> dict:
     except (json.JSONDecodeError, ValueError):
         quarantine_corrupt(CHANNEL_PINS_FILE)
         return {}
+
+
+PENDING_RETRIES_FILE = os.getenv("PENDING_RETRIES_FILE", "/data/pending_retries.json")
+
+
+def save_pending_retries(entries: list[dict]) -> None:
+    """Delayed translation retries that haven't run yet, so a restart/deploy
+    inside the retry window doesn't drop them. Holds only ids and text — never
+    webhook URLs (they embed auth tokens); those are resolved at run time."""
+    atomic_write_json(PENDING_RETRIES_FILE, entries)
+
+
+def load_pending_retries() -> list[dict]:
+    if not os.path.exists(PENDING_RETRIES_FILE):
+        return []
+    try:
+        with open(PENDING_RETRIES_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except OSError:
+        return []
+    except ValueError:
+        quarantine_corrupt(PENDING_RETRIES_FILE)
+        return []
+    if not isinstance(raw, list):
+        return []
+    required = {"text": str, "src": str, "dest": str, "guild_id": int,
+                "ch_id": int, "msg_id": int, "due": (int, float)}
+    return [
+        entry for entry in raw
+        if isinstance(entry, dict)
+        and all(isinstance(entry.get(k), t) for k, t in required.items())
+    ]

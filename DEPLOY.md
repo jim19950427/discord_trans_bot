@@ -149,4 +149,5 @@ python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.jsonl
 6. 要測試備援時，暫時把 NAS `.env` 的 key 改為字面值 `invalid-test-key`，只重建 bot container，送一段未快取文字，確認 `provider=libretranslate`；隨即還原 Key 1 並再次重建 bot。切勿將真 key 放在命令列。
 7. 輪替金鑰時先讓 bot 改用 Key 2、重建並確認 Azure 成功，最後才在 Azure portal 重新產生 Key 1。
 8. 要新增 LibreTranslate 備援語言時，必須將相應 Libre 語言代碼加入 `docker-compose.yml` 的 `LT_LOAD_ONLY`，以 `./deploy.sh --with-deps` 上傳，再於 NAS 專案目錄執行 `sudo docker compose up -d --force-recreate libretranslate`，或在 Container Manager 重新建立 LibreTranslate 服務的 container，才能套用環境變數。單純重建 image 或重新啟動舊 container 不會更新環境設定。待 `/languages` 顯示新增代碼後再驗收；Azure 支援的新語言本身不需要修改這份清單。
+9. bot 容器的 healthcheck（依 `/data/heartbeat` 的更新時間判斷）寫在 `docker-compose.yml`，程式碼部署（`./deploy.sh`）不會套用它。首次啟用需 `./deploy.sh --with-deps` 上傳後，在 NAS 專案目錄執行 `sudo docker compose up -d --force-recreate discord-trans-bot`。啟用後 Container Manager 會顯示健康狀態；即使不啟用 healthcheck，程式內建的看門狗仍會在卡死時自行結束並由 Docker 重啟。
 9. 以有「管理頻道」權限的帳號執行 `/translation-status`。回覆應只對該使用者可見，並顯示 Azure 批次健康、Libre `/languages` 探測與最近備援資訊；畫面不得包含金鑰、Webhook URL、原文或譯文。

@@ -57,3 +57,10 @@ def test_deploy_stages_then_swaps_in_place_and_verifies_restart():
     assert " mv " not in deploy
     for module in ("config.py", "glossary.py", "translator.py", "bot.py"):
         assert module in deploy
+
+
+def test_bot_container_has_heartbeat_healthcheck():
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
+    check = compose["services"]["discord-trans-bot"]["healthcheck"]
+    assert "/data/heartbeat" in " ".join(check["test"])
+    assert "HEARTBEAT_FILE" in (ROOT / "bot.py").read_text()

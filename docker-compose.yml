@@ -16,6 +16,13 @@ services:
     environment:
       - CONFIG_FILE=/data/channel_config.json
       - GLOSSARY_FILE=/data/glossary.json
+    healthcheck:
+      # The bot touches /data/heartbeat every 30s while connected to Discord.
+      test: ["CMD", "python", "-c", "import os,sys,time; sys.exit(0 if time.time()-os.path.getmtime('/data/heartbeat')<120 else 1)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
 
   libretranslate:
     image: libretranslate/libretranslate:v1.9.6
