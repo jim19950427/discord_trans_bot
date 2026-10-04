@@ -46,12 +46,43 @@ stage() {
 # 不能用 mv：docker-compose 是單檔 bind mount，mv 會換 inode，
 # 容器會一直看到舊檔，熱重載就失效。所有檔案在同一個 ssh 內一次套用，
 # 避免 watcher 在多檔上傳之間重啟而載入新舊混合的版本。
+# 套用前先把現有檔案備份成 <檔名>.bak；任何一個檔案寫入失敗（磁碟滿、
+# 權限）就用備份把已動到的檔案全部還原，不會留下新舊混合的程式。
+# 結束碼：2 = 備份失敗（尚未動任何檔案）、3 = 套用失敗（已還原）。
 apply_all() {
-    local cmd="set -e;" f
-    for f in "${FILES[@]}"; do
-        cmd+=" cat '${DEST}/${f}.new' > '${DEST}/${f}' && rm -f '${DEST}/${f}.new';"
+    local rc=0
+    ssh "${SSH_OPTS[@]}" "$NAS" sh -s -- "$DEST" "${FILES[@]}" <<'REMOTE' || rc=$?
+dest="$1"; shift
+fail=0
+for f in "$@"; do
+    if [ -f "$dest/$f" ]; then
+        cp -p "$dest/$f" "$dest/$f.bak" || fail=1
+    fi
+done
+if [ "$fail" = 1 ]; then
+    for f in "$@"; do rm -f "$dest/$f.bak"; done
+    exit 2
+fi
+for f in "$@"; do
+    if ! cat "$dest/$f.new" > "$dest/$f"; then fail=1; break; fi
+done
+if [ "$fail" = 1 ]; then
+    for f in "$@"; do
+        if [ -f "$dest/$f.bak" ]; then
+            cat "$dest/$f.bak" > "$dest/$f"
+        fi
     done
-    ssh "${SSH_OPTS[@]}" "$NAS" "$cmd" || error "套用失敗（.new 暫存檔仍在 NAS 上）"
+    for f in "$@"; do rm -f "$dest/$f.bak"; done
+    exit 3
+fi
+for f in "$@"; do rm -f "$dest/$f.new" "$dest/$f.bak"; done
+REMOTE
+    case "$rc" in
+        0) ;;
+        2) error "NAS 上備份現有檔案失敗（磁碟空間？），尚未套用任何檔案；.new 暫存檔仍在 NAS 上" ;;
+        3) error "套用中途失敗，已用備份還原所有檔案（NAS 仍是舊版）；.new 暫存檔仍在 NAS 上" ;;
+        *) error "套用時 SSH 失敗（結束碼 ${rc}）；請檢查 NAS 上的 .bak / .new 檔案是否需要手動處理" ;;
+    esac
 }
 
 echo -e "\n${BOLD}${CYAN}🚀  Discord Trans Bot — 部署到 DSM${RESET}\n"
@@ -88,7 +119,7 @@ info  "等待容器 file watcher 偵測變更並重啟（最多 60 秒）..."
 # 部署後驗證：status.json 的 last_start 變了，才代表真的重啟
 RESTARTED=0
 for _ in $(seq 1 12); do
-    sleep 5
+    sleep "${DEPLOY_POLL_INTERVAL:-5}"
     AFTER="$(read_status)"
     if [ -n "$AFTER" ] && [ "$AFTER" != "$BEFORE" ]; then
         RESTARTED=1
