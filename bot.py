@@ -1,13 +1,30 @@
 import os
 import io
+import time
+import json
+import threading
 import asyncio
+from dataclasses import dataclass
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from translator import translate_text, translate_text_nocache, normalize_lang
-from config import load_channel_config, save_channel_config
+from translator import (
+    TranslationOutcome,
+    translate_text,
+    translate_text_nocache,
+    translate_text_with_status,
+    translate_many_with_status,
+    get_translation_status,
+    normalize_lang,
+    has_translatable_content,
+    log_event,
+)
+from config import (
+    CONFIG_FILE, atomic_write_json, cleanup_stale_tmp,
+    load_channel_config, save_channel_config,
+)
 from glossary import (
     load_glossary, save_glossary, get_guild_glossary,
     load_substitutions, save_substitutions, get_guild_substitutions,
@@ -20,6 +37,43 @@ from glossary import (
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# Remove temp files from atomic writes interrupted by a crash / hot-reload.
+# Must run at import, before the persist loop or log threads can write.
+import glossary as _glossary_module
+import translator as _translator_module
+cleanup_stale_tmp([
+    CONFIG_FILE, _translator_module.LOG_FILE,
+    os.environ.get("STATUS_FILE", "/data/status.json"),
+    _glossary_module.GLOSSARY_FILE, _glossary_module.SUBSTITUTIONS_FILE,
+    _glossary_module.USER_LANGS_FILE, _glossary_module.CLUSTERS_FILE,
+    _glossary_module.THREAD_CLUSTERS_FILE, _glossary_module.CHANNEL_PINS_FILE,
+])
+
+# ── Hot-reload file watcher ────────────────────────────────────────────────
+# Polls the mtime of all source files every 10 s; calls os._exit(0) on any
+# change so Docker's restart policy brings the container back on new code.
+# Must use os._exit (not sys.exit) — sys.exit only unwinds the calling thread
+# and leaves the main process alive, silently preventing the reload.
+def _watch_source_files():
+    _root = os.path.dirname(os.path.abspath(__file__))
+    _watched = [
+        os.path.join(_root, f)
+        for f in ("bot.py", "translator.py", "translation_providers.py", "config.py", "glossary.py")
+    ]
+    _mtimes = {f: os.path.getmtime(f) for f in _watched if os.path.exists(f)}
+    while True:
+        time.sleep(10)
+        for f in _watched:
+            try:
+                if os.path.getmtime(f) != _mtimes.get(f):
+                    log_event(f"[hot-reload] {os.path.basename(f)} changed — restarting")
+                    os._exit(0)
+            except OSError:
+                pass
+
+threading.Thread(target=_watch_source_files, daemon=True).start()
+# ──────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -42,6 +96,18 @@ WEBHOOK_NAME = "TranslationBot"
 NO_TRANSLATE_PREFIX = "//"
 RAW_FORWARD_PREFIX = "\\"
 FEEDBACK_EMOJI = "🔄"
+AUTO_SOURCE_LANGUAGE = "auto"
+
+
+@dataclass(frozen=True)
+class _ForwardResult:
+    message_id: int
+    text: str
+    translation_succeeded: bool
+
+    def __iter__(self):
+        yield self.message_id
+        yield self.text
 
 # msg_id -> cluster dict shared by all messages in a translation group
 # cluster keys:
@@ -50,12 +116,12 @@ FEEDBACK_EMOJI = "🔄"
 #   author         display name of the original sender
 #   avatar_url     avatar URL (needed for delete+resend on attachment edit)
 #   source_ch      channel_id of the original message
-#   source_lang    language code of the original channel
+#   source_lang    translation source mode (always "auto" for new clusters)
 #   prefixes       {channel_id: blockquote_prefix_string}  (reply messages only)
 #   att_names      {channel_id: [filename, ...]}  for detecting attachment changes
 #   embed_count    number of embeds seen so far (for link-preview forwarding)
 _msg_clusters: dict[int, dict] = {}
-_MAX_CLUSTER_ENTRIES = int(os.getenv("MAX_CLUSTER_ENTRIES", "1500"))
+_MAX_CLUSTER_ENTRIES = int(os.getenv("MAX_CLUSTER_ENTRIES", "2000"))
 
 # Cached pinned message ID sets per channel for change detection
 _channel_pins: dict[int, set[int]] = {}
@@ -174,14 +240,21 @@ async def on_ready():
     if not _persist_clusters.is_running():
         _persist_clusters.start()
 
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    print(f"Loaded channel configs for {len(channel_configs)} guild(s)")
-    print(f"Restored {len(_msg_clusters)} msg clusters, {len(_thread_clusters)} thread clusters")
+    log_event(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    log_event(f"Loaded channel configs for {len(channel_configs)} guild(s)")
+    log_event(f"Restored {len(_msg_clusters)} msg clusters, {len(_thread_clusters)} thread clusters")
     try:
         synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
+        log_event(f"Synced {len(synced)} slash command(s)")
     except Exception as e:
-        print(f"Failed to sync slash commands: {e}")
+        log_event(f"Failed to sync slash commands: {e}")
+
+    # Write a startup marker so deploy verification can confirm restart via SSH.
+    _status_file = os.environ.get("STATUS_FILE", "/data/status.json")
+    try:
+        atomic_write_json(_status_file, {"last_start": time.strftime("%Y-%m-%d %H:%M:%S")})
+    except Exception as _e:
+        print(f"[status write failed] {_e}")
 
 
 # ---------------------------------------------------------------------------
@@ -231,7 +304,9 @@ async def on_message(message: discord.Message):
     if not content and not attachments and not stickers:
         return
 
-    source_lang = guild_channels[source_ch_id]["lang"]
+    # A channel's configured language describes its output, not what users
+    # are allowed to type there. Providers always detect message language.
+    source_lang = AUTO_SOURCE_LANGUAGE
     username = message.author.display_name
     avatar_url = str(message.author.display_avatar.url)
     guild_glossary = get_guild_glossary(message.guild.id, _glossary_data)
@@ -241,9 +316,7 @@ async def on_message(message: discord.Message):
     if message.reference and message.reference.message_id:
         ref_cluster = _msg_clusters.get(message.reference.message_id)
 
-    tasks = []
-    target_channel_ids = []
-    target_thread_ids: list[int | None] = []
+    deliveries = []
     for channel_id, info in guild_channels.items():
         if channel_id == source_ch_id:
             continue
@@ -256,29 +329,62 @@ async def on_message(message: discord.Message):
             target_thread_id = thread_map.get(channel_id)
             if target_thread_id is None:
                 continue  # no corresponding thread in this channel
-        target_lang = info["lang"]
+        target_lang = normalize_lang(info["lang"])
         quoted = _quoted_text(ref_cluster, channel_id) if ref_cluster else None
         quoted_author = ref_cluster.get("author") if ref_cluster else None
         msg_link = _ref_msg_link(ref_cluster, channel_id, message.guild.id) if ref_cluster else None
-        tasks.append(
+        deliveries.append((
+            channel_id, target_lang, webhook_url, quoted, quoted_author,
+            target_thread_id, msg_link,
+        ))
+
+    if not deliveries:
+        return
+
+    if raw_forward:
+        tasks = [
             _raw_forward_send(
                 content, webhook_url, username, avatar_url, attachments, stickers,
                 quoted, quoted_author, target_thread_id, msg_link,
-            ) if raw_forward else
-            _translate_and_send(
-                content, source_lang, target_lang,
-                webhook_url, username, avatar_url,
-                attachments, stickers, quoted, quoted_author,
-                guild_glossary, guild_substitutions, target_thread_id, msg_link,
             )
+            for _, _, webhook_url, quoted, quoted_author, target_thread_id, msg_link in deliveries
+        ]
+    else:
+        # Attachments and stickers are forwarded without asking a provider to
+        # translate an empty body.  Otherwise translate once before fan-out;
+        # outcomes are looked up by canonical target key below.
+        outcomes = (
+            await asyncio.to_thread(
+                translate_many_with_status,
+                content,
+                [target_lang for _, target_lang, *_ in deliveries],
+                guild_glossary,
+                guild_substitutions,
+            )
+            if content else {}
         )
-        target_channel_ids.append(channel_id)
-        target_thread_ids.append(target_thread_id)
+        tasks = [
+            _send_pretranslated(
+                outcomes.get(target_lang, TranslationOutcome(None, False)),
+                target_lang, webhook_url, username, avatar_url,
+                attachments, stickers, quoted, quoted_author,
+                target_thread_id, msg_link,
+            )
+            for _, target_lang, webhook_url, quoted, quoted_author, target_thread_id, msg_link in deliveries
+        ]
 
-    if not tasks:
-        return
+    target_channel_ids = [channel_id for channel_id, *_ in deliveries]
+    target_thread_ids = [target_thread_id for *_, target_thread_id, _ in deliveries]
 
-    results = await asyncio.gather(*tasks)
+    # return_exceptions=True: one channel's send failing (e.g. an unhandled
+    # discord.HTTPException) must not abort the cluster build below — that
+    # would silently drop every OTHER channel's already-sent message from
+    # tracking too, breaking edit/delete/pin sync for them as well.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for ch_id, result in zip(target_channel_ids, results):
+        if isinstance(result, BaseException):
+            log_event(f"[forward] task failed for channel {ch_id}: {result}")
+    results = [None if isinstance(r, BaseException) else r for r in results]
 
     cluster: dict = {
         "channels": {source_ch_id: message.id},
@@ -288,6 +394,7 @@ async def on_message(message: discord.Message):
         "avatar_url": avatar_url,
         "source_ch": source_ch_id,
         "source_lang": source_lang,
+        "raw_forward": raw_forward,
         "prefixes": {},
         "att_names": {source_ch_id: [a.filename for a in attachments]},
         "att_urls":  {source_ch_id: [a.url for a in attachments]},
@@ -321,18 +428,25 @@ async def on_message(message: discord.Message):
 
     _store_cluster(cluster)
 
-    # Schedule a delayed retry for channels where translation failed
-    # (sent text equals original source text — translation fell back to original)
-    if not raw_forward and content:
+    # Schedule a delayed retry only when the explicit provider status says
+    # translation failed. Equal text can be a valid auto-detected success.
+    # Skip messages with nothing translatable (pure mention/custom-emoji/Unicode
+    # emoji) — those intentionally come back unchanged, that's not a failure.
+    if not raw_forward and content and has_translatable_content(content):
         for ch_id, result in zip(target_channel_ids, results):
             if result is None:
                 continue
             sent_id, sent_text = result
-            if sent_text.strip() == content.strip():
+            translation_succeeded = getattr(
+                result,
+                "translation_succeeded",
+                sent_text.strip() != content.strip(),
+            )
+            if not translation_succeeded:
                 asyncio.create_task(
                     _retry_translate(
                         content, source_lang,
-                        guild_channels[ch_id]["lang"],
+                        normalize_lang(guild_channels[ch_id]["lang"]),
                         guild_channels[ch_id]["webhook_url"],
                         sent_id, ch_id, cluster, guild_glossary,
                     )
@@ -367,16 +481,21 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         return
 
     new_content = message.content.strip()
+    raw_forward = new_content.startswith(RAW_FORWARD_PREFIX)
+    if raw_forward:
+        new_content = new_content[len(RAW_FORWARD_PREFIX):].lstrip()
     current_attachments = list(message.attachments)
     current_stickers = [s for s in message.stickers if s.format != discord.StickerFormatType.lottie]
     current_embeds = message.embeds
 
-    source_lang = guild_channels[source_ch_id]["lang"]
     guild_glossary = get_guild_glossary(channel.guild.id, _glossary_data)
     guild_substitutions = get_guild_substitutions(channel.guild.id, _substitutions_data)
 
     edit_targets = [
-        (ch_id, msg_id, guild_channels[ch_id]["lang"], guild_channels[ch_id]["webhook_url"])
+        (
+            ch_id, msg_id, normalize_lang(guild_channels[ch_id]["lang"]),
+            guild_channels[ch_id]["webhook_url"],
+        )
         for ch_id, msg_id in cluster["channels"].items()
         if ch_id != source_ch_id
         and ch_id in guild_channels
@@ -393,7 +512,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                     webhook = discord.Webhook.from_url(wh_url, session=session)
                     await webhook.edit_message(msg_id, embeds=current_embeds)
             except Exception as e:
-                print(f"Failed to forward embeds to channel {ch_id}: {e}")
+                log_event(f"Failed to forward embeds to channel {ch_id}: {e}")
 
     # --- Text / attachment edit ---
     if not new_content and not current_attachments and not current_stickers:
@@ -409,18 +528,36 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
             for ch_id, msg_id, _, wh_url in edit_targets
         ])
 
+        outcomes = (
+            await asyncio.to_thread(
+                translate_many_with_status,
+                new_content,
+                [lang for _, _, lang, _ in edit_targets],
+                guild_glossary,
+                guild_substitutions,
+            )
+            if new_content and not raw_forward else {}
+        )
         send_results = await asyncio.gather(*[
-            _translate_and_send(
-                new_content, source_lang, lang,
-                wh_url, cluster["author"], cluster["avatar_url"],
-                current_attachments, current_stickers,
-                cluster.get("prefixes", {}).get(ch_id),
-                None, guild_glossary, guild_substitutions,
+            (
+                _raw_forward_send(
+                    new_content, wh_url, cluster["author"], cluster["avatar_url"],
+                    current_attachments, current_stickers,
+                    cluster.get("prefixes", {}).get(ch_id), None,
+                )
+                if raw_forward else
+                _send_pretranslated(
+                    outcomes.get(lang, TranslationOutcome(None, False)), lang,
+                    wh_url, cluster["author"], cluster["avatar_url"],
+                    current_attachments, current_stickers,
+                    cluster.get("prefixes", {}).get(ch_id), None,
+                )
             )
             for ch_id, _, lang, wh_url in edit_targets
         ])
 
         cluster["contents"][source_ch_id] = new_content
+        cluster["raw_forward"] = raw_forward
         cluster["att_names"][source_ch_id] = curr_att_names
         for (ch_id, old_msg_id, _, _), result in zip(edit_targets, send_results):
             _msg_clusters.pop(old_msg_id, None)
@@ -431,11 +568,28 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                 cluster["att_names"][ch_id] = curr_att_names
                 _msg_clusters[new_msg_id] = cluster
     elif new_content:
+        outcomes = (
+            await asyncio.to_thread(
+                translate_many_with_status,
+                new_content,
+                [lang for _, _, lang, _ in edit_targets],
+                guild_glossary,
+                guild_substitutions,
+            )
+            if not raw_forward else {}
+        )
         edit_results = await asyncio.gather(*[
-            _translate_and_edit(new_content, source_lang, lang, wh_url, msg_id, ch_id, cluster, guild_glossary, guild_substitutions)
+            _edit_pretranslated(
+                (
+                    TranslationOutcome(new_content, True)
+                    if raw_forward else outcomes.get(lang, TranslationOutcome(None, False))
+                ),
+                wh_url, msg_id, ch_id, cluster,
+            )
             for ch_id, msg_id, lang, wh_url in edit_targets
         ])
         cluster["contents"][source_ch_id] = new_content
+        cluster["raw_forward"] = raw_forward
         for (ch_id, _, _, _), translated in zip(edit_targets, edit_results):
             if translated:
                 cluster["contents"][ch_id] = translated
@@ -447,6 +601,16 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     if not cluster:
         return
 
+    # Clear every sibling key for this cluster BEFORE awaiting the deletes
+    # below. The bot's own deletion of each mirror message also fires this
+    # same event, and without clearing synchronously first, those cascading
+    # events can each still find the cluster (since the delete gather below
+    # yields control) and redundantly re-run this whole handler for the same
+    # cluster — observed in production as the same message getting repeated
+    # "already deleted" 404s.
+    for msg_id in list(cluster["channels"].values()):
+        _msg_clusters.pop(msg_id, None)
+
     guild_channels = _guild_channels_for(payload.channel_id)
 
     await asyncio.gather(*[
@@ -456,9 +620,6 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
         and ch_id in guild_channels
         and guild_channels[ch_id].get("webhook_url")
     ])
-
-    for msg_id in list(cluster["channels"].values()):
-        _msg_clusters.pop(msg_id, None)
 
 
 @bot.event
@@ -520,7 +681,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             msg = await ch.fetch_message(msg_id)
             await msg.add_reaction(payload.emoji)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            print(f"Failed to add reaction in channel {channel_id}: {e}")
+            log_event(f"Failed to add reaction in channel {channel_id}: {e}")
 
 
 @bot.event
@@ -542,7 +703,7 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
             msg = await ch.fetch_message(msg_id)
             await msg.remove_reaction(payload.emoji, bot.user)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            print(f"Failed to remove reaction in channel {channel_id}: {e}")
+            log_event(f"Failed to remove reaction in channel {channel_id}: {e}")
 
 
 @bot.event
@@ -562,7 +723,7 @@ async def on_raw_reaction_clear(payload: discord.RawReactionClearEvent):
             msg = await ch.fetch_message(msg_id)
             await msg.clear_reactions()
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            print(f"Failed to clear reactions in channel {channel_id}: {e}")
+            log_event(f"Failed to clear reactions in channel {channel_id}: {e}")
 
 
 @bot.event
@@ -582,7 +743,7 @@ async def on_raw_reaction_clear_emoji(payload: discord.RawReactionClearEmojiEven
             msg = await ch.fetch_message(msg_id)
             await msg.clear_reaction(payload.emoji)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            print(f"Failed to clear emoji reaction in channel {channel_id}: {e}")
+            log_event(f"Failed to clear emoji reaction in channel {channel_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +780,7 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
                 await (await ch.fetch_message(cluster_msg_id)).pin()
                 _channel_pins.setdefault(ch_id, set()).add(cluster_msg_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-                print(f"Failed to pin {cluster_msg_id} in channel {ch_id}: {e}")
+                log_event(f"Failed to pin {cluster_msg_id} in channel {ch_id}: {e}")
 
     for msg_id in prev_ids - current_ids:
         cluster = _msg_clusters.get(msg_id)
@@ -637,7 +798,7 @@ async def on_guild_channel_pins_update(channel: discord.abc.GuildChannel, _last_
                 await (await ch.fetch_message(cluster_msg_id)).unpin()
                 _channel_pins.get(ch_id, set()).discard(cluster_msg_id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-                print(f"Failed to unpin {cluster_msg_id} in channel {ch_id}: {e}")
+                log_event(f"Failed to unpin {cluster_msg_id} in channel {ch_id}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -655,19 +816,27 @@ async def on_thread_create(thread: discord.Thread):
     if thread.parent_id not in all_gc:
         return
     gc = _group_channels(all_gc, thread.parent_id)
-    source_lang = gc[thread.parent_id]["lang"]
     thread_map: dict[int, int] = {thread.parent_id: thread.id}
 
-    for ch_id, info in gc.items():
-        if ch_id == thread.parent_id:
-            continue
-        target_ch = bot.get_channel(ch_id)
-        if not isinstance(target_ch, discord.TextChannel):
-            continue
-        target_lang = info["lang"]
-        translated_name = await asyncio.to_thread(
-            translate_text, thread.name, source_lang, target_lang
-        ) or thread.name
+    thread_targets = [
+        (ch_id, normalize_lang(info["lang"]), target_ch)
+        for ch_id, info in gc.items()
+        if ch_id != thread.parent_id
+        and isinstance((target_ch := bot.get_channel(ch_id)), discord.TextChannel)
+    ]
+    outcomes = (
+        await asyncio.to_thread(
+            translate_many_with_status,
+            thread.name,
+            [target_lang for _, target_lang, _ in thread_targets],
+        )
+        if thread_targets else {}
+    )
+
+    for ch_id, target_lang, target_ch in thread_targets:
+        translated_name = outcomes.get(
+            target_lang, TranslationOutcome(None, False)
+        ).text or thread.name
         try:
             new_thread = await target_ch.create_thread(
                 name=translated_name[:100],
@@ -675,7 +844,7 @@ async def on_thread_create(thread: discord.Thread):
             )
             thread_map[ch_id] = new_thread.id
         except Exception as e:
-            print(f"[thread] failed to create in ch={ch_id}: {e}")
+            log_event(f"[thread] failed to create in ch={ch_id}: {e}")
 
     # Bidirectional index so any thread_id can look up the full mapping
     for tid in thread_map.values():
@@ -695,12 +864,15 @@ async def _retry_translate(
     ch_id: int,
     cluster: dict,
     glossary: dict | None = None,
-    delay: int = 10,
+    delay: int = 60,
 ) -> None:
     await asyncio.sleep(delay)
-    translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {})
-    if not translated or translated.strip() == text.strip():
-        print(f"[retry] still failed ({src}->{dest}): {repr(text)}")
+    outcome = await asyncio.to_thread(
+        translate_text_with_status, text, src, dest, glossary or {}
+    )
+    translated = outcome.text
+    if not outcome.provider_succeeded or not translated:
+        log_event(f"[retry] still failed ({src}->{dest}): {repr(text)}")
         return
     prefix = cluster.get("prefixes", {}).get(ch_id, "")
     full_content = f"{prefix}\n{translated}" if prefix else translated
@@ -709,9 +881,9 @@ async def _retry_translate(
             webhook = discord.Webhook.from_url(webhook_url, session=session)
             await webhook.edit_message(msg_id, content=full_content)
         cluster["contents"][ch_id] = translated
-        print(f"[retry] updated ({src}->{dest}): {repr(translated)}")
+        log_event(f"[retry] updated ({src}->{dest}): {repr(translated)}")
     except Exception as e:
-        print(f"[retry] edit failed msg={msg_id} ch={ch_id}: {e}")
+        log_event(f"[retry] edit failed msg={msg_id} ch={ch_id}: {e}")
 
 
 async def _raw_forward_send(
@@ -725,7 +897,7 @@ async def _raw_forward_send(
     quoted_author: str | None = None,
     thread_id: int | None = None,
     msg_link: str | None = None,
-) -> tuple[int, str] | None:
+) -> _ForwardResult | None:
     files: list[discord.File] = []
     urls: list[tuple[str, str]] = (
         [(att.url, att.filename) for att in attachments]
@@ -739,7 +911,7 @@ async def _raw_forward_send(
                         data = await resp.read()
                         files.append(discord.File(io.BytesIO(data), filename=filename))
         except Exception as e:
-            print(f"Download failed ({filename}): {e}")
+            log_event(f"Download failed ({filename}): {e}")
 
     if not text and not files:
         return None
@@ -765,15 +937,19 @@ async def _raw_forward_send(
     if thread_id:
         send_kwargs["thread"] = discord.Object(id=thread_id)
 
-    async with aiohttp.ClientSession() as session:
-        webhook = discord.Webhook.from_url(webhook_url, session=session)
-        msg = await webhook.send(**send_kwargs)
-        return msg.id, text or ""
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            msg = await webhook.send(**send_kwargs)
+            return msg.id, text or ""
+    except Exception as e:
+        # Never log webhook_url — it embeds the webhook's auth token.
+        log_event(f"[forward] send failed (author={username!r}, files={len(files)}): {e}")
+        return None
 
 
-async def _translate_and_send(
-    text: str,
-    src: str,
+async def _send_pretranslated(
+    outcome: TranslationOutcome,
     dest: str,
     webhook_url: str,
     username: str,
@@ -782,14 +958,10 @@ async def _translate_and_send(
     stickers: list,
     quoted_content: str | None,
     quoted_author: str | None = None,
-    glossary: dict | None = None,
-    substitutions: dict | None = None,
     thread_id: int | None = None,
     msg_link: str | None = None,
-) -> tuple[int, str] | None:
-    translated: str | None = None
-    if text:
-        translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {}, substitutions or {})
+) -> _ForwardResult | None:
+    translated = outcome.text
 
     files: list[discord.File] = []
     urls: list[tuple[str, str]] = (
@@ -804,7 +976,7 @@ async def _translate_and_send(
                         data = await resp.read()
                         files.append(discord.File(io.BytesIO(data), filename=filename))
         except Exception as e:
-            print(f"Download failed ({filename}): {e}")
+            log_event(f"Download failed ({filename}): {e}")
 
     if not translated and not files:
         return None
@@ -830,10 +1002,78 @@ async def _translate_and_send(
     if thread_id:
         send_kwargs["thread"] = discord.Object(id=thread_id)
 
-    async with aiohttp.ClientSession() as session:
-        webhook = discord.Webhook.from_url(webhook_url, session=session)
-        msg = await webhook.send(**send_kwargs)
-        return msg.id, translated or ""
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            msg = await webhook.send(**send_kwargs)
+            return _ForwardResult(
+                msg.id,
+                translated or "",
+                outcome.provider_succeeded,
+            )
+    except Exception as e:
+        # Never log webhook_url — it embeds the webhook's auth token.
+        log_event(f"[forward] send failed (author={username!r}, dest={dest}, files={len(files)}): {e}")
+        return None
+
+
+async def _translate_and_send(
+    text: str,
+    src: str,
+    dest: str,
+    webhook_url: str,
+    username: str,
+    avatar_url: str,
+    attachments: list,
+    stickers: list,
+    quoted_content: str | None,
+    quoted_author: str | None = None,
+    glossary: dict | None = None,
+    substitutions: dict | None = None,
+    thread_id: int | None = None,
+    msg_link: str | None = None,
+) -> _ForwardResult | None:
+    """Single-target compatibility wrapper around pretranslated delivery."""
+    outcome = TranslationOutcome(None, True)
+    if text:
+        outcome = await asyncio.to_thread(
+            translate_text_with_status,
+            text,
+            src,
+            dest,
+            glossary or {},
+            substitutions or {},
+        )
+    return await _send_pretranslated(
+        outcome, dest, webhook_url, username, avatar_url,
+        attachments, stickers, quoted_content, quoted_author,
+        thread_id, msg_link,
+    )
+
+
+async def _edit_pretranslated(
+    outcome: TranslationOutcome,
+    webhook_url: str,
+    msg_id: int,
+    ch_id: int,
+    cluster: dict,
+) -> str | None:
+    translated = outcome.text
+    if not translated:
+        return None
+
+    prefix = cluster.get("prefixes", {}).get(ch_id, "")
+    full_content = f"{prefix}\n{translated}" if prefix else translated
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(webhook_url, session=session)
+            await webhook.edit_message(msg_id, content=full_content)
+    except Exception as e:
+        log_event(f"Failed to edit webhook message {msg_id} in channel {ch_id}: {e}")
+        return None
+
+    return translated
 
 
 async def _translate_and_edit(
@@ -847,22 +1087,12 @@ async def _translate_and_edit(
     glossary: dict | None = None,
     substitutions: dict | None = None,
 ) -> str | None:
-    translated = await asyncio.to_thread(translate_text, text, src, dest, glossary or {}, substitutions or {})
-    if not translated:
-        return None
-
-    prefix = cluster.get("prefixes", {}).get(ch_id, "")
-    full_content = f"{prefix}\n{translated}" if prefix else translated
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(webhook_url, session=session)
-            await webhook.edit_message(msg_id, content=full_content)
-    except Exception as e:
-        print(f"Failed to edit webhook message {msg_id} in channel {ch_id}: {e}")
-        return None
-
-    return translated
+    """Single-target compatibility wrapper around pretranslated editing."""
+    outcome = await asyncio.to_thread(
+        translate_text_with_status,
+        text, src, dest, glossary or {}, substitutions or {},
+    )
+    return await _edit_pretranslated(outcome, webhook_url, msg_id, ch_id, cluster)
 
 
 async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> None:
@@ -871,7 +1101,122 @@ async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> 
             webhook = discord.Webhook.from_url(webhook_url, session=session)
             await webhook.delete_message(msg_id)
     except Exception as e:
-        print(f"Failed to delete webhook message {msg_id} in channel {ch_id}: {e}")
+        log_event(f"Failed to delete webhook message {msg_id} in channel {ch_id}: {e}")
+
+
+class _ClusterAttachment:
+    """Stand-in for discord.Attachment, built from the url/filename pairs a
+    cluster already persists. Only .url/.filename are read by the download
+    helpers in _send_pretranslated / _raw_forward_send, so this is enough to
+    re-run a forward without the original discord.Message object."""
+    __slots__ = ("url", "filename")
+
+    def __init__(self, url: str, filename: str):
+        self.url = url
+        self.filename = filename
+
+
+async def _retry_missing_channels(cluster: dict, guild_id: int) -> tuple[list[int], list[int]]:
+    """Forward the source message to any group channels missing from the
+    cluster — i.e. channels whose original webhook.send() failed and were
+    silently dropped (see _translate_and_send / _raw_forward_send). Returns
+    (succeeded_channel_ids, failed_channel_ids).
+
+    Text is translated as one batch before retry fan-out. Raw-forward and
+    attachment-only clusters are delivered without invoking translation.
+    """
+    source_ch_id = cluster["source_ch"]
+    group_channels = _guild_channels_for(source_ch_id)
+    missing = [
+        ch_id for ch_id, info in group_channels.items()
+        if ch_id != source_ch_id
+        and info.get("webhook_url")
+        and ch_id not in cluster["channels"]
+    ]
+    if not missing:
+        return [], []
+
+    source_text = cluster["contents"].get(source_ch_id, "")
+    username = cluster.get("author", "")
+    avatar_url = cluster.get("avatar_url", "")
+    attachments = [
+        _ClusterAttachment(url, name)
+        for url, name in zip(
+            cluster.get("att_urls", {}).get(source_ch_id, []),
+            cluster.get("att_names", {}).get(source_ch_id, []),
+        )
+    ]
+    guild_glossary = get_guild_glossary(guild_id, _glossary_data)
+    guild_substitutions = get_guild_substitutions(guild_id, _substitutions_data)
+    outcomes = (
+        await asyncio.to_thread(
+            translate_many_with_status,
+            source_text,
+            [normalize_lang(group_channels[ch_id]["lang"]) for ch_id in missing],
+            guild_glossary,
+            guild_substitutions,
+        )
+            if source_text and not cluster.get("raw_forward") else {}
+    )
+
+    # Thread routing mirrors on_message: the source's own thread id (if any)
+    # looks up the matching per-channel thread ids via the same registry.
+    source_thread_id = cluster.get("thread_channels", {}).get(source_ch_id)
+    thread_map = _thread_clusters.get(source_thread_id) if source_thread_id else None
+
+    async def _retry_one(ch_id: int):
+        info = group_channels[ch_id]
+        target_thread_id = thread_map.get(ch_id) if thread_map else None
+        if thread_map is not None and target_thread_id is None:
+            return ch_id, None
+        # quoted_content/quoted_author are deliberately not passed here:
+        # cluster["prefixes"][ch_id] already holds a fully "> "-formatted
+        # reply-quote block, but _send_pretranslated expects the *raw* quote
+        # text and applies its own "> " prefixing — passing the pre-formatted
+        # block through would double-quote it (e.g. "> > **name**: ..."). The
+        # tradeoff: a backfilled message loses its reply-quote header if the
+        # original had one; the alternative (visibly broken quoting) is worse.
+        target_lang = normalize_lang(info["lang"])
+        result = (
+            await _raw_forward_send(
+                source_text, info["webhook_url"], username, avatar_url,
+                attachments, [], None, None, target_thread_id, None,
+            )
+            if cluster.get("raw_forward") else
+            await _send_pretranslated(
+                outcomes.get(target_lang, TranslationOutcome(None, False)), target_lang,
+                info["webhook_url"], username, avatar_url,
+                attachments, [],  # stickers aren't persisted on the cluster
+                None, None, target_thread_id, None,
+            )
+        )
+        return ch_id, result
+
+    pairs = await asyncio.gather(*[_retry_one(ch_id) for ch_id in missing])
+
+    succeeded, failed = [], []
+    for ch_id, result in pairs:
+        if result is None:
+            failed.append(ch_id)
+            continue
+        sent_id, sent_text = result
+        cluster["channels"][ch_id] = sent_id
+        cluster["contents"][ch_id] = sent_text or ""
+        cluster["att_names"][ch_id] = cluster.get("att_names", {}).get(source_ch_id, [])
+        cluster["att_urls"][ch_id] = cluster.get("att_urls", {}).get(source_ch_id, [])
+        if thread_map is not None:
+            tid = thread_map.get(ch_id)
+            if tid is not None:
+                cluster.setdefault("thread_channels", {})[ch_id] = tid
+        succeeded.append(ch_id)
+
+    if succeeded:
+        _store_cluster(cluster)
+        log_event(f"[forward-retry] backfilled channels {succeeded} for source msg in ch={source_ch_id}")
+    if failed:
+        log_event(f"[forward-retry] still failed for channels {failed} for source msg in ch={source_ch_id}")
+
+    return succeeded, failed
 
 
 async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_id: int) -> str | None:
@@ -882,7 +1227,7 @@ async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_i
     info = guild_channels[parent_ch_id]
     source_ch = cluster["source_ch"]
     source_text = cluster["contents"].get(source_ch, "")
-    source_lang = cluster["source_lang"]
+    source_lang = AUTO_SOURCE_LANGUAGE
     target_lang = info["lang"]
     if source_lang == target_lang or not source_text:
         return None
@@ -905,10 +1250,10 @@ async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_i
             webhook = discord.Webhook.from_url(webhook_url, session=session)
             await webhook.edit_message(msg_id, content=full_content)
         cluster["contents"][parent_ch_id] = translated
-        print(f"[retranslate] ({source_lang}->{target_lang}) updated msg={msg_id}")
+        log_event(f"[retranslate] ({source_lang}->{target_lang}) updated msg={msg_id}")
         return translated
     except Exception as e:
-        print(f"[retranslate] edit failed msg={msg_id}: {e}")
+        log_event(f"[retranslate] edit failed msg={msg_id}: {e}")
         return None
 
 
@@ -930,6 +1275,11 @@ async def _handle_feedback(payload: discord.RawReactionActionEvent, cluster: dic
             break
     if guild_id is None:
         return
+
+    # Whatever copy the user reacted on, also retry any channels the cluster
+    # never reached in the first place — the cluster is shared, so this
+    # backfill applies regardless of which channel triggered the reaction.
+    await _retry_missing_channels(cluster, guild_id)
 
     msg_id = cluster["channels"].get(parent_ch_id)
     if not msg_id:
@@ -986,6 +1336,142 @@ async def prefix_listlang(ctx: commands.Context):
 # ---------------------------------------------------------------------------
 # Slash commands
 # ---------------------------------------------------------------------------
+
+_STATUS_UNAVAILABLE = "尚無資料"
+_SAFE_STATUS_REASONS = frozenset({
+    "request_error", "invalid_json", "invalid_response", "circuit_open",
+    "azure_failed", "libretranslate_failed", "missing_key", "empty_response",
+    "partial_response",
+})
+_SAFE_CIRCUIT_STATES = frozenset({"closed", "open", "half_open"})
+
+
+def _status_timestamp(value) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"<t:{int(value)}:R>"
+    return _STATUS_UNAVAILABLE
+
+
+def _status_number(value, suffix: str = "") -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{int(value)}{suffix}"
+    return _STATUS_UNAVAILABLE
+
+
+def _status_reason(value) -> str:
+    if isinstance(value, str):
+        if value in _SAFE_STATUS_REASONS:
+            return value
+        if (
+            value.startswith("http_")
+            and value[5:].isdigit()
+            and 100 <= int(value[5:]) <= 599
+        ):
+            return value
+    return _STATUS_UNAVAILABLE
+
+
+def _status_languages(value) -> str:
+    if not isinstance(value, list):
+        return _STATUS_UNAVAILABLE
+    languages = [
+        language for language in value
+        if isinstance(language, str)
+        and language.replace("-", "").replace("_", "").isalnum()
+        and len(language) <= 20
+    ]
+    return "、".join(languages) if languages else _STATUS_UNAVAILABLE
+
+
+def _provider_last_result(provider: dict) -> str:
+    success_at = provider.get("last_success_at")
+    failure_at = provider.get("last_failure_at")
+    if isinstance(success_at, (int, float)) and not isinstance(success_at, bool) and (
+        not isinstance(failure_at, (int, float)) or isinstance(failure_at, bool)
+        or success_at >= failure_at
+    ):
+        return f"成功（{_status_timestamp(success_at)}）"
+    if isinstance(failure_at, (int, float)) and not isinstance(failure_at, bool):
+        return (
+            f"失敗（{_status_timestamp(failure_at)}；"
+            f"{_status_reason(provider.get('last_failure_reason'))}）"
+        )
+    return _STATUS_UNAVAILABLE
+
+
+def _format_translation_status(status: dict) -> discord.Embed:
+    """Render only the health data deliberately approved for the status command."""
+    if not isinstance(status, dict):
+        status = {}
+    azure = status.get("azure") if isinstance(status.get("azure"), dict) else {}
+    libretranslate = (
+        status.get("libretranslate")
+        if isinstance(status.get("libretranslate"), dict)
+        else {}
+    )
+    fallback = status.get("fallback") if isinstance(status.get("fallback"), dict) else {}
+    probe = (
+        status.get("libretranslate_probe")
+        if isinstance(status.get("libretranslate_probe"), dict)
+        else None
+    )
+
+    circuit_state = azure.get("circuit_state")
+    circuit = (
+        circuit_state
+        if isinstance(circuit_state, str) and circuit_state in _SAFE_CIRCUIT_STATES
+        else _STATUS_UNAVAILABLE
+    )
+    azure_value = "\n".join((
+        f"設定：{'已設定' if azure.get('configured') is True else '未設定'}",
+        f"熔斷器：{circuit}",
+        f"最近結果：{_provider_last_result(azure)}",
+        f"最近延遲：{_status_number(azure.get('last_latency_ms'), ' ms')}",
+        f"最近目標數：{_status_number(azure.get('last_target_count'))}",
+    ))
+
+    if probe is None:
+        libre_result = "未探測（被動結果）"
+        libre_languages = _STATUS_UNAVAILABLE
+    else:
+        probe_latency = _status_number(probe.get("latency_ms"), " ms")
+        if probe.get("healthy") is True:
+            libre_result = f"健康（{probe_latency}）"
+        else:
+            libre_result = f"失敗（{probe_latency}；{_status_reason(probe.get('failure_reason'))}）"
+        libre_languages = _status_languages(probe.get("languages"))
+    libre_value = "\n".join((
+        f"探測：{libre_result}",
+        f"被動結果：{_provider_last_result(libretranslate)}",
+        f"已載入語言：{libre_languages}",
+    ))
+
+    fallback_value = "\n".join((
+        f"最近備援：{_status_timestamp(fallback.get('last_at'))}",
+        f"原因：{_status_reason(fallback.get('reason'))}",
+    ))
+
+    embed = discord.Embed(title="翻譯服務狀態", color=discord.Color.blue())
+    embed.add_field(name="Azure Translator", value=azure_value, inline=False)
+    embed.add_field(name="LibreTranslate", value=libre_value, inline=False)
+    embed.add_field(name="最近備援", value=fallback_value, inline=False)
+    return embed
+
+
+@bot.tree.command(name="translation-status", description="查看翻譯服務健康狀態")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_translation_status(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        status = await asyncio.to_thread(get_translation_status, probe_libre=True)
+        embed = _format_translation_status(status)
+    except Exception:
+        embed = discord.Embed(
+            title="翻譯服務狀態",
+            description="暫時無法取得狀態，翻譯服務不受此查詢影響。",
+            color=discord.Color.orange(),
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @bot.tree.command(name="addlang", description="設定語言頻道")
 @app_commands.describe(
@@ -1282,6 +1768,18 @@ async def retranslate_context_menu(interaction: discord.Interaction, message: di
         )
         return
 
+    guild_id = interaction.guild_id
+    if guild_id is None:
+        await interaction.followup.send(
+            await _ui_msg(uid, "找不到對應的伺服器設定。"), ephemeral=True
+        )
+        return
+
+    # Whatever copy this was used on, also retry any channels the cluster
+    # never reached in the first place (e.g. a channel whose webhook.send()
+    # failed on the original forward) — the cluster is shared across copies.
+    backfilled, still_missing = await _retry_missing_channels(cluster, guild_id)
+
     # Find parent_ch_id for this message in the cluster
     parent_ch_id: int | None = None
     for pid, mid in cluster["channels"].items():
@@ -1295,25 +1793,22 @@ async def retranslate_context_menu(interaction: discord.Interaction, message: di
         return
 
     if parent_ch_id == cluster["source_ch"]:
-        await interaction.followup.send(
-            await _ui_msg(uid, "此訊息是原文，無法重新翻譯。"), ephemeral=True
-        )
-        return
-
-    guild_id: int | None = None
-    for guild in bot.guilds:
-        if parent_ch_id in channel_configs.get(guild.id, {}):
-            guild_id = guild.id
-            break
-    if guild_id is None:
-        await interaction.followup.send(
-            await _ui_msg(uid, "找不到對應的伺服器設定。"), ephemeral=True
-        )
+        if backfilled:
+            names = "、".join(f"<#{c}>" for c in backfilled)
+            await interaction.followup.send(f"已補發到：{names}", ephemeral=True)
+        elif still_missing:
+            names = "、".join(f"<#{c}>" for c in still_missing)
+            await interaction.followup.send(f"補發失敗：{names}", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                await _ui_msg(uid, "此訊息是原文，無法重新翻譯。"), ephemeral=True
+            )
         return
 
     translated = await _do_retranslate(parent_ch_id, message.id, cluster, guild_id)
     if translated:
-        await interaction.followup.send(await _ui_msg(uid, "已重新翻譯。"), ephemeral=True)
+        note = f"（另補發到：{'、'.join(f'<#{c}>' for c in backfilled)}）" if backfilled else ""
+        await interaction.followup.send(await _ui_msg(uid, "已重新翻譯。") + note, ephemeral=True)
     else:
         await interaction.followup.send(
             await _ui_msg(uid, "重新翻譯失敗，或翻譯結果與原文相同。"), ephemeral=True
@@ -1355,18 +1850,21 @@ async def translate_context_menu(interaction: discord.Interaction, message: disc
     ch_id = message.channel.id
     if isinstance(message.channel, discord.Thread) and message.channel.parent_id:
         ch_id = message.channel.parent_id
-    source_lang = all_gc[ch_id]["lang"] if ch_id in all_gc else "auto"
+    source_lang = AUTO_SOURCE_LANGUAGE
 
-    target_langs = [normalize_lang(l) for l in user_langs]
+    target_langs = list(dict.fromkeys(normalize_lang(lang) for lang in user_langs))
 
     guild_glossary = get_guild_glossary(interaction.guild_id, _glossary_data)
-    results = await asyncio.gather(*[
-        asyncio.to_thread(translate_text, text, source_lang, lang, guild_glossary)
-        for lang in target_langs
-    ])
+    outcomes = await asyncio.to_thread(
+        translate_many_with_status, text, target_langs, guild_glossary
+    )
 
     src_label = source_lang if source_lang != "auto" else "自動偵測"
-    valid_results = [(lang, t) for lang, t in zip(target_langs, results) if t]
+    valid_results = [
+        (lang, outcomes[lang].text)
+        for lang in target_langs
+        if outcomes.get(lang) and outcomes[lang].text
+    ]
     # Discord embed total limit is 6000 chars; divide evenly across all fields
     num_fields = 1 + len(valid_results)
     per_field = min(1024, max(100, 5500 // num_fields))
@@ -1380,6 +1878,7 @@ async def translate_context_menu(interaction: discord.Interaction, message: disc
 
 
 # Slash command error handlers
+@slash_translation_status.error
 @slash_addlang.error
 @slash_removelang.error
 @slash_addterm.error

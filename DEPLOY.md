@@ -74,7 +74,11 @@ discord_trans_bot/
 DISCORD_TOKEN=你的Bot_Token貼在這裡
 
 # 可選設定（有預設值，不填也可以）
-# MAX_CLUSTER_ENTRIES=1500   ← 追蹤訊息上限（預設 1500，超過時自動淘汰最舊的）
+# MAX_CLUSTER_ENTRIES=2000            ← 追蹤訊息上限（預設 2000，超過時自動淘汰最舊的）
+# TRANSLATE_CACHE_DIR=/data/translate_cache   ← 翻譯快取目錄（預設值如左，已包含在 data volume 內，重啟不會消失）
+# TRANSLATE_CACHE_SIZE_LIMIT=52428800         ← 翻譯快取容量上限，單位 bytes（預設 50MB，超過時自動淘汰最少使用的項目）
+# BOT_LOG_FILE=/data/bot_log.jsonl      ← 機器人運作紀錄檔（JSON Lines，每行一筆），涵蓋翻譯呼叫與所有錯誤/事件訊息，方便除錯查詢
+# BOT_LOG_MAX_ENTRIES=5000             ← 紀錄檔上限筆數（預設 5000，超過時自動淘汰最舊的紀錄）
 ```
 
 > 若 File Station 不允許建立以點開頭的檔案，可先命名為 `env.txt` 上傳後再改名，或透過 SSH 建立。
@@ -118,3 +122,31 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 
 > **什麼時候才需要重新建置 Image？**  
 > 只有當 `requirements.txt` 內的套件版本有變更時，才需要在 Container Manager 專案中選擇 **重新建置（Build）**。一般程式邏輯的更新不需要此步驟。
+
+---
+
+## 四、Azure 與 NAS LibreTranslate 備援
+
+1. 只在 NAS 的 `/volume1/docker/discord-trans-bot/.env` 設定 Azure Key 1：`AZURE_TRANSLATOR_KEY=...`；`AZURE_TRANSLATOR_REGION=eastasia`，endpoint 使用 `https://api.cognitive.microsofttranslator.com`。不要把真實 key 貼進終端機參數、shell history 或聊天。
+2. 一般程式更新只需在本機執行 `./deploy.sh`（code-only）；它只傳送掛載的原始碼，**不會讀取、上傳或覆寫 NAS `.env`**。只有 Docker 設定或 Python 依賴變更時，才使用 `./deploy.sh --with-deps` 並到 Container Manager 重建 image。
+3. 啟動 LibreTranslate。第一次下載模型可能需要數分鐘，health status 顯示 `starting` 是正常的；其 port 不會發布到 NAS 外部。
+4. 以 SSH 驗證：
+
+```bash
+cd /volume1/docker/discord-trans-bot
+sudo docker compose ps
+sudo docker compose exec discord-trans-bot python -c "import requests; print([x['code'] for x in requests.get('http://libretranslate:5000/languages', timeout=10).json()])"
+```
+
+5. 用 Discord 傳送測試訊息驗證 Azure，並檢查已清除敏感資料的 provider event：
+
+```bash
+python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.jsonl"; rows=[json.loads(l) for l in open(p) if l.strip()]; print(*[({k:r.get(k) for k in ("time","provider","success","target_count","latency_ms","fallback_reason","circuit_state")}) for r in rows if r.get("type")=="translate_provider"][-10:], sep="\n")'
+```
+
+   批次驗收時，從 `zh-TW` 頻道送出一段未快取的英文，目標設為 `en`、`ja`、`ko`，且不含會拆分輸入的詞彙表內容。預期英文照常送達，日文與韓文各送到正確頻道；上列查詢在此次測試時間應顯示一筆 `provider=azure`、`success=True`、`target_count=3` 的事件。一般情況下，每個相容且未快取的提供者輸入群組各有一筆 Azure 事件；`target_count` 是該批去重後的目標鍵數，不是頻道數。指向同一 Azure 代碼的別名共用一個 `to` 參數，但仍各算一個目標鍵。缺 key 或斷路器開啟時的略過事件也有此欄位，不代表實際送出 Azure 請求。
+
+6. 要測試備援時，暫時把 NAS `.env` 的 key 改為字面值 `invalid-test-key`，只重建 bot container，送一段未快取文字，確認 `provider=libretranslate`；隨即還原 Key 1 並再次重建 bot。切勿將真 key 放在命令列。
+7. 輪替金鑰時先讓 bot 改用 Key 2、重建並確認 Azure 成功，最後才在 Azure portal 重新產生 Key 1。
+8. 要新增 LibreTranslate 備援語言時，必須將相應 Libre 語言代碼加入 `docker-compose.yml` 的 `LT_LOAD_ONLY`，以 `./deploy.sh --with-deps` 上傳，再於 NAS 專案目錄執行 `sudo docker compose up -d --force-recreate libretranslate`，或在 Container Manager 重新建立 LibreTranslate 服務的 container，才能套用環境變數。單純重建 image 或重新啟動舊 container 不會更新環境設定。待 `/languages` 顯示新增代碼後再驗收；Azure 支援的新語言本身不需要修改這份清單。
+9. 以有「管理頻道」權限的帳號執行 `/translation-status`。回覆應只對該使用者可見，並顯示 Azure 批次健康、Libre `/languages` 探測與最近備援資訊；畫面不得包含金鑰、Webhook URL、原文或譯文。

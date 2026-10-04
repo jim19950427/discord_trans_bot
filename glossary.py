@@ -1,6 +1,8 @@
 import json
 import os
 
+from config import atomic_write_json, quarantine_corrupt
+
 GLOSSARY_FILE = os.getenv("GLOSSARY_FILE", "/data/glossary.json")
 SUBSTITUTIONS_FILE = os.getenv("SUBSTITUTIONS_FILE", "/data/substitutions.json")
 
@@ -17,9 +19,7 @@ def load_glossary() -> dict:
 
 
 def save_glossary(data: dict) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(GLOSSARY_FILE)), exist_ok=True)
-    with open(GLOSSARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(GLOSSARY_FILE, data, indent=2)
 
 
 def get_guild_glossary(guild_id: int, glossary_data: dict) -> dict:
@@ -38,9 +38,7 @@ def load_substitutions() -> dict:
 
 
 def save_substitutions(data: dict) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(SUBSTITUTIONS_FILE)), exist_ok=True)
-    with open(SUBSTITUTIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(SUBSTITUTIONS_FILE, data, indent=2)
 
 
 def get_guild_substitutions(guild_id: int, sub_data: dict) -> dict:
@@ -62,9 +60,7 @@ def load_user_langs() -> dict:
 
 
 def save_user_langs(data: dict) -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(USER_LANGS_FILE)), exist_ok=True)
-    with open(USER_LANGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    atomic_write_json(USER_LANGS_FILE, data, indent=2)
 
 
 CLUSTERS_FILE = os.getenv("CLUSTERS_FILE", "/data/msg_clusters.json")
@@ -86,6 +82,7 @@ def save_clusters(clusters: dict) -> None:
             "avatar_url":  cluster.get("avatar_url", ""),
             "source_ch":   cluster["source_ch"],
             "source_lang": cluster["source_lang"],
+            "raw_forward": cluster.get("raw_forward", False),
         }
         for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
             if opt_key in cluster:
@@ -93,9 +90,7 @@ def save_clusters(clusters: dict) -> None:
         if "embed_count" in cluster:
             entry["embed_count"] = cluster["embed_count"]
         serialized[str(msg_id)] = entry
-    os.makedirs(os.path.dirname(os.path.abspath(CLUSTERS_FILE)), exist_ok=True)
-    with open(CLUSTERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(serialized, f, ensure_ascii=False)
+    atomic_write_json(CLUSTERS_FILE, serialized, skip_if_unchanged=True)
 
 
 def load_clusters() -> dict:
@@ -113,6 +108,7 @@ def load_clusters() -> dict:
                 "avatar_url":  entry.get("avatar_url", ""),
                 "source_ch":   int(entry["source_ch"]),
                 "source_lang": entry["source_lang"],
+                "raw_forward": entry.get("raw_forward", False),
             }
             for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
                 if opt_key in entry:
@@ -121,7 +117,10 @@ def load_clusters() -> dict:
                 cluster["embed_count"] = entry["embed_count"]
             result[int(msg_id_str)] = cluster
         return result
-    except (json.JSONDecodeError, OSError, KeyError, ValueError):
+    except OSError:
+        return {}
+    except (json.JSONDecodeError, ValueError, KeyError):
+        quarantine_corrupt(CLUSTERS_FILE)
         return {}
 
 
@@ -130,9 +129,7 @@ def save_thread_clusters(thread_clusters: dict) -> None:
         str(tid): {str(k): v for k, v in mapping.items()}
         for tid, mapping in thread_clusters.items()
     }
-    os.makedirs(os.path.dirname(os.path.abspath(THREAD_CLUSTERS_FILE)), exist_ok=True)
-    with open(THREAD_CLUSTERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(serialized, f)
+    atomic_write_json(THREAD_CLUSTERS_FILE, serialized, skip_if_unchanged=True)
 
 
 def load_thread_clusters() -> dict:
@@ -142,15 +139,16 @@ def load_thread_clusters() -> dict:
         with open(THREAD_CLUSTERS_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         return {int(tid): {int(k): v for k, v in mapping.items()} for tid, mapping in raw.items()}
-    except (json.JSONDecodeError, OSError, ValueError):
+    except OSError:
+        return {}
+    except (json.JSONDecodeError, ValueError):
+        quarantine_corrupt(THREAD_CLUSTERS_FILE)
         return {}
 
 
 def save_channel_pins(channel_pins: dict) -> None:
-    serialized = {str(ch_id): list(pins) for ch_id, pins in channel_pins.items()}
-    os.makedirs(os.path.dirname(os.path.abspath(CHANNEL_PINS_FILE)), exist_ok=True)
-    with open(CHANNEL_PINS_FILE, "w", encoding="utf-8") as f:
-        json.dump(serialized, f)
+    serialized = {str(ch_id): sorted(pins) for ch_id, pins in channel_pins.items()}
+    atomic_write_json(CHANNEL_PINS_FILE, serialized, skip_if_unchanged=True)
 
 
 def load_channel_pins() -> dict:
@@ -160,5 +158,8 @@ def load_channel_pins() -> dict:
         with open(CHANNEL_PINS_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         return {int(ch_id): set(pins) for ch_id, pins in raw.items()}
-    except (json.JSONDecodeError, OSError, ValueError):
+    except OSError:
+        return {}
+    except (json.JSONDecodeError, ValueError):
+        quarantine_corrupt(CHANNEL_PINS_FILE)
         return {}
