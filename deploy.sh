@@ -48,7 +48,8 @@ stage() {
 # 避免 watcher 在多檔上傳之間重啟而載入新舊混合的版本。
 # 套用前先把現有檔案備份成 <檔名>.bak；任何一個檔案寫入失敗（磁碟滿、
 # 權限）就用備份把已動到的檔案全部還原，不會留下新舊混合的程式。
-# 結束碼：2 = 備份失敗（尚未動任何檔案）、3 = 套用失敗（已還原）。
+# 結束碼：2 = 備份失敗（尚未動任何檔案）、3 = 套用失敗（已還原並驗證）、
+# 4 = 套用失敗且還原也失敗（保留所有 .bak，需手動處理）。
 apply_all() {
     local rc=0
     ssh "${SSH_OPTS[@]}" "$NAS" sh -s -- "$DEST" "${FILES[@]}" <<'REMOTE' || rc=$?
@@ -67,11 +68,19 @@ for f in "$@"; do
     if ! cat "$dest/$f.new" > "$dest/$f"; then fail=1; break; fi
 done
 if [ "$fail" = 1 ]; then
+    same() { [ "$(cksum < "$1")" = "$(cksum < "$2")" ]; }
+    restore_fail=0
     for f in "$@"; do
-        if [ -f "$dest/$f.bak" ]; then
-            cat "$dest/$f.bak" > "$dest/$f"
+        [ -f "$dest/$f.bak" ] || continue
+        # Skip files the failed run never touched (e.g. one that rejected the
+        # write); only a verified restore counts.
+        same "$dest/$f.bak" "$dest/$f" && continue
+        if ! { cat "$dest/$f.bak" > "$dest/$f" && same "$dest/$f.bak" "$dest/$f"; }; then
+            restore_fail=1
         fi
     done
+    # Keep every .bak if any restore failed: they are the only good copy.
+    if [ "$restore_fail" = 1 ]; then exit 4; fi
     for f in "$@"; do rm -f "$dest/$f.bak"; done
     exit 3
 fi
@@ -81,6 +90,7 @@ REMOTE
         0) ;;
         2) error "NAS 上備份現有檔案失敗（磁碟空間？），尚未套用任何檔案；.new 暫存檔仍在 NAS 上" ;;
         3) error "套用中途失敗，已用備份還原所有檔案（NAS 仍是舊版）；.new 暫存檔仍在 NAS 上" ;;
+        4) error "套用失敗，而且還原也失敗！NAS 上的 *.bak 是唯一完好的舊版，已全部保留；請先手動還原（cat 檔名.bak > 檔名）再重啟容器" ;;
         *) error "套用時 SSH 失敗（結束碼 ${rc}）；請檢查 NAS 上的 .bak / .new 檔案是否需要手動處理" ;;
     esac
 }

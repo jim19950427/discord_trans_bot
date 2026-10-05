@@ -84,3 +84,35 @@ def test_failure_midway_restores_every_file(nas):
         assert (dest / name).read_text() == f"OLD {name}\n", name
     assert not list(dest.glob("*.bak"))
     assert (dest / "bot.py.new").exists()  # staged files kept for inspection
+
+
+def test_failed_restore_keeps_backups_and_reports_distinct_error(nas, tmp_path):
+    dest, env = nas
+    # Fake `cat`: the swap of translator.py writes a partial file then fails
+    # (disk full), and restoring translator.py from its backup fails too.
+    fake_bin = Path(env["PATH"].split(":")[0])
+    real_cat = subprocess.run(["which", "cat"], capture_output=True, text=True).stdout.strip()
+    fake_cat = fake_bin / "cat"
+    fake_cat.write_text(f"""#!/bin/bash
+case "$1" in
+  *translator.py.new) printf PARTIAL; exit 1 ;;
+  *translator.py.bak) exit 1 ;;
+esac
+exec {real_cat} "$@"
+""")
+    fake_cat.chmod(0o755)
+
+    result = run_deploy(env)
+
+    assert result.returncode != 0
+    assert "還原也失敗" in result.stdout
+    assert (dest / "translator.py.bak").read_text() == "OLD translator.py\n"
+    # The failed restore truncated the file first, so the damage is real and
+    # the .bak above is the only good copy.
+    assert (dest / "translator.py").read_text() != "OLD translator.py\n"
+    # Everything that could be restored was.
+    for name in ("bot.py", "translation_providers.py", "config.py", "glossary.py"):
+        assert (dest / name).read_text() == f"OLD {name}\n", name
+    # Every backup is kept so nothing is lost.
+    for name in CODE_FILES:
+        assert (dest / f"{name}.bak").exists(), name

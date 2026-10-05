@@ -69,12 +69,14 @@ def retry_env(tmp_path, monkeypatch):
         7: {202: {"lang": "ko", "webhook_url": "https://example.invalid/hook", "group": "default"}}
     })
     calls = []
+    clusters = []
 
     async def fake_retry(text, src, dest, webhook_url, msg_id, ch_id, cluster, glossary=None, delay=60):
         calls.append((text, dest, webhook_url, msg_id, ch_id, delay))
+        clusters.append(cluster)
 
     monkeypatch.setattr(bot_module, "_retry_translate", fake_retry)
-    return SimpleNamespace(calls=calls, file=tmp_path / "pending.json", cluster=cluster)
+    return SimpleNamespace(calls=calls, clusters=clusters, file=tmp_path / "pending.json", cluster=cluster)
 
 
 def test_scheduled_retry_is_persisted_without_webhook_url_then_cleared(retry_env):
@@ -108,8 +110,38 @@ def test_pending_retries_are_restored_after_restart(retry_env):
     assert [c[0] for c in retry_env.calls] == ["hi"]  # stale one discarded
 
 
-def test_retry_for_untracked_message_is_dropped(retry_env, monkeypatch):
-    monkeypatch.setattr(bot_module, "_msg_clusters", {})  # evicted from cluster cache
+def test_retry_still_edits_when_cluster_was_never_persisted(retry_env, monkeypatch):
+    """Restart inside the retry window: clusters are saved every 60s, so the
+    message's cluster is usually not on disk. The stored prefix must be enough."""
+    monkeypatch.setattr(bot_module, "_msg_clusters", {})
+
+    async def scenario():
+        await bot_module._schedule_retry(
+            "hello", "auto", "ko", 7, 202, 4321, delay=0, prefix="> **A**: quoted")
+        await asyncio.gather(*list(bot_module._background_tasks))
+
+    run(scenario())
+    assert [c[0] for c in retry_env.calls] == ["hello"]
+    assert retry_env.clusters[0]["prefixes"] == {202: "> **A**: quoted"}
+
+
+def test_prefix_is_persisted_and_survives_restore(retry_env, monkeypatch):
+    import time
+    glossary.save_pending_retries([{
+        "text": "hi", "src": "auto", "dest": "ko", "guild_id": 7, "ch_id": 202,
+        "msg_id": 4321, "due": time.time() - 1, "prefix": "> quoted"}])
+    monkeypatch.setattr(bot_module, "_msg_clusters", {})
+
+    async def scenario():
+        await bot_module._restore_pending_retries()
+        await asyncio.gather(*list(bot_module._background_tasks))
+
+    run(scenario())
+    assert retry_env.clusters[0]["prefixes"] == {202: "> quoted"}
+
+
+def test_retry_for_removed_channel_is_dropped(retry_env, monkeypatch):
+    monkeypatch.setattr(bot_module, "channel_configs", {7: {}})
 
     async def scenario():
         await bot_module._schedule_retry("hello", "auto", "ko", 7, 202, 4321, delay=0)
@@ -117,6 +149,20 @@ def test_retry_for_untracked_message_is_dropped(retry_env, monkeypatch):
 
     run(scenario())
     assert retry_env.calls == []
+    assert json.loads(retry_env.file.read_text()) == []
+
+
+def test_scheduling_the_same_message_twice_runs_one_retry(retry_env):
+    async def scenario():
+        await bot_module._schedule_retry("hello", "auto", "ko", 7, 202, 4321, delay=0.05)
+        await bot_module._schedule_retry("hello", "auto", "ko", 7, 202, 4321, delay=0.05)
+        assert len(bot_module._background_tasks) == 1
+        saved = json.loads(retry_env.file.read_text())
+        assert len(saved) == 1
+        await asyncio.gather(*list(bot_module._background_tasks))
+
+    run(scenario())
+    assert len(retry_env.calls) == 1
     assert json.loads(retry_env.file.read_text()) == []
 
 

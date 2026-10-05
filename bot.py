@@ -547,6 +547,7 @@ async def on_message(message: discord.Message):
                     content, source_lang,
                     normalize_lang(guild_channels[ch_id]["lang"]),
                     message.guild.id, ch_id, sent_id,
+                    prefix=cluster.get("prefixes", {}).get(ch_id, ""),
                 )
 
 
@@ -999,13 +1000,21 @@ async def _persist_pending_retries() -> None:
 
 async def _schedule_retry(
     text: str, src: str, dest: str, guild_id: int, ch_id: int, msg_id: int,
-    delay: float = RETRY_DELAY_SECONDS,
+    delay: float = RETRY_DELAY_SECONDS, prefix: str = "",
 ) -> None:
+    key = _retry_key(ch_id, msg_id)
+    if key in _pending_retries:
+        # One live task per message: a second would let whichever finishes
+        # first delete the other's persisted entry.
+        return
+    # `prefix` (the reply-quote header) is stored so the edit can be rebuilt
+    # after a restart even though clusters are only saved every 60s and the
+    # cluster for this message may not be on disk yet.
     entry = {
         "text": text, "src": src, "dest": dest, "guild_id": guild_id,
         "ch_id": ch_id, "msg_id": msg_id, "due": time.time() + delay,
+        "prefix": prefix,
     }
-    key = _retry_key(ch_id, msg_id)
     _pending_retries[key] = entry
     await _persist_pending_retries()
     _spawn(_run_retry(key))
@@ -1018,13 +1027,18 @@ async def _run_retry(key: str) -> None:
     try:
         await asyncio.sleep(max(0.0, entry["due"] - time.time()))
         info = channel_configs.get(entry["guild_id"], {}).get(entry["ch_id"])
-        cluster = _msg_clusters.get(entry["msg_id"])
-        if not info or not info.get("webhook_url") or cluster is None:
+        if not info or not info.get("webhook_url"):
             log_event(
-                f"[retry] dropped: channel or message no longer tracked "
+                f"[retry] dropped: channel no longer configured "
                 f"(ch={entry['ch_id']} msg={entry['msg_id']})"
             )
             return
+        cluster = _msg_clusters.get(entry["msg_id"])
+        if cluster is None:
+            # Not tracked in memory — typically a retry restored after a
+            # restart whose cluster was never persisted. The stored prefix is
+            # enough to edit the message; there is no cluster to update.
+            cluster = {"prefixes": {entry["ch_id"]: entry.get("prefix", "")}, "contents": {}}
         await _retry_translate(
             entry["text"], entry["src"], entry["dest"], info["webhook_url"],
             entry["msg_id"], entry["ch_id"], cluster,

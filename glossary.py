@@ -194,4 +194,5 @@ def load_pending_retries() -> list[dict]:
         entry for entry in raw
         if isinstance(entry, dict)
         and all(isinstance(entry.get(k), t) for k, t in required.items())
+        and isinstance(entry.get("prefix", ""), str)
     ]
