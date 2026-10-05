@@ -156,4 +156,4 @@ python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.jsonl
 8. 要新增 LibreTranslate 備援語言時，必須將相應 Libre 語言代碼加入 `docker-compose.yml` 的 `LT_LOAD_ONLY`，以 `./deploy.sh --with-deps` 上傳，再於 NAS 專案目錄執行 `sudo /usr/local/bin/docker compose -p trans-bot up -d --force-recreate libretranslate`，或在 Container Manager 重新建立 LibreTranslate 服務的 container，才能套用環境變數。單純重建 image 或重新啟動舊 container 不會更新環境設定。待 `/languages` 顯示新增代碼後再驗收；Azure 支援的新語言本身不需要修改這份清單。
 9. 想在出錯時收到通知：在 `.env` 設定 `ALERT_CHANNEL_ID`（機器人要能在該頻道發訊息，建議用只有你看得到的私人頻道），然後重建 bot 容器（環境變數只在建立容器時讀入）。告警內容會遮蔽 webhook 網址並截斷；機器人整個掛掉（無法連上 Discord）時無法告警。
 10. bot 容器的 healthcheck（依 `/data/heartbeat` 的更新時間判斷）寫在 `docker-compose.yml`，程式碼部署（`./deploy.sh`）不會套用它。首次啟用需 `./deploy.sh --with-deps` 上傳後，在 NAS 專案目錄執行 `sudo /usr/local/bin/docker compose -p trans-bot up -d --force-recreate discord-trans-bot`。啟用後 Container Manager 會顯示健康狀態；即使不啟用 healthcheck，程式內建的看門狗仍會在卡死時自行結束並由 Docker 重啟。
-9. 以有「管理頻道」權限的帳號執行 `/translation-status`。回覆應只對該使用者可見，並顯示 Azure 批次健康、Libre `/languages` 探測與最近備援資訊；畫面不得包含金鑰、Webhook URL、原文或譯文。
+11. 以有「管理頻道」權限的帳號執行 `/translation-status`。回覆應只對該使用者可見，並顯示 Azure 批次健康、Libre `/languages` 探測與最近備援資訊；畫面不得包含金鑰、Webhook URL、原文或譯文。
