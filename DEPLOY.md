@@ -79,6 +79,9 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 # TRANSLATE_CACHE_SIZE_LIMIT=52428800         ← 翻譯快取容量上限，單位 bytes（預設 50MB，超過時自動淘汰最少使用的項目）
 # BOT_LOG_FILE=/data/bot_log.jsonl      ← 機器人運作紀錄檔（JSON Lines，每行一筆），涵蓋翻譯呼叫與所有錯誤/事件訊息，方便除錯查詢
 # BOT_LOG_MAX_ENTRIES=5000             ← 紀錄檔上限筆數（預設 5000，超過時自動淘汰最舊的紀錄）
+# ALERT_CHANNEL_ID=123456789012345678  ← 告警頻道 ID（預設關閉）。設定後，機器人發生錯誤（log 的 type=error）或被看門狗自動重啟時，會在該頻道發一則訊息
+# ALERT_MIN_INTERVAL_SECONDS=600      ← 同類告警的最短間隔（預設 600 秒）
+# ALERT_MAX_PER_HOUR=6                ← 每小時告警上限（預設 6 則，超過的會合併計數）
 ```
 
 > 若 File Station 不允許建立以點開頭的檔案，可先命名為 `env.txt` 上傳後再改名，或透過 SSH 建立。
@@ -151,5 +154,6 @@ python3 -c 'import json; p="/volume1/docker/discord-trans-bot/data/bot_log.jsonl
 6. 要測試備援時，暫時把 NAS `.env` 的 key 改為字面值 `invalid-test-key`，只重建 bot container，送一段未快取文字，確認 `provider=libretranslate`；隨即還原 Key 1 並再次重建 bot。切勿將真 key 放在命令列。
 7. 輪替金鑰時先讓 bot 改用 Key 2、重建並確認 Azure 成功，最後才在 Azure portal 重新產生 Key 1。
 8. 要新增 LibreTranslate 備援語言時，必須將相應 Libre 語言代碼加入 `docker-compose.yml` 的 `LT_LOAD_ONLY`，以 `./deploy.sh --with-deps` 上傳，再於 NAS 專案目錄執行 `sudo /usr/local/bin/docker compose -p trans-bot up -d --force-recreate libretranslate`，或在 Container Manager 重新建立 LibreTranslate 服務的 container，才能套用環境變數。單純重建 image 或重新啟動舊 container 不會更新環境設定。待 `/languages` 顯示新增代碼後再驗收；Azure 支援的新語言本身不需要修改這份清單。
-9. bot 容器的 healthcheck（依 `/data/heartbeat` 的更新時間判斷）寫在 `docker-compose.yml`，程式碼部署（`./deploy.sh`）不會套用它。首次啟用需 `./deploy.sh --with-deps` 上傳後，在 NAS 專案目錄執行 `sudo /usr/local/bin/docker compose -p trans-bot up -d --force-recreate discord-trans-bot`。啟用後 Container Manager 會顯示健康狀態；即使不啟用 healthcheck，程式內建的看門狗仍會在卡死時自行結束並由 Docker 重啟。
+9. 想在出錯時收到通知：在 `.env` 設定 `ALERT_CHANNEL_ID`（機器人要能在該頻道發訊息，建議用只有你看得到的私人頻道），然後重建 bot 容器（環境變數只在建立容器時讀入）。告警內容會遮蔽 webhook 網址並截斷；機器人整個掛掉（無法連上 Discord）時無法告警。
+10. bot 容器的 healthcheck（依 `/data/heartbeat` 的更新時間判斷）寫在 `docker-compose.yml`，程式碼部署（`./deploy.sh`）不會套用它。首次啟用需 `./deploy.sh --with-deps` 上傳後，在 NAS 專案目錄執行 `sudo /usr/local/bin/docker compose -p trans-bot up -d --force-recreate discord-trans-bot`。啟用後 Container Manager 會顯示健康狀態；即使不啟用 healthcheck，程式內建的看門狗仍會在卡死時自行結束並由 Docker 重啟。
 9. 以有「管理頻道」權限的帳號執行 `/translation-status`。回覆應只對該使用者可見，並顯示 Azure 批次健康、Libre `/languages` 探測與最近備援資訊；畫面不得包含金鑰、Webhook URL、原文或譯文。
