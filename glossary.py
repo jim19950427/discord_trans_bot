@@ -72,64 +72,123 @@ def _int_key_dict(d: dict) -> dict:
     return {int(k): v for k, v in d.items()}
 
 
-def save_clusters(clusters: dict) -> None:
-    serialized: dict = {}
+CLUSTERS_FORMAT_VERSION = 2
+
+
+def _serialize_cluster(cluster: dict) -> dict:
+    entry: dict = {
+        "channels":    {str(k): v for k, v in cluster["channels"].items()},
+        "contents":    {str(k): v for k, v in cluster["contents"].items()},
+        "author":      cluster.get("author", ""),
+        "avatar_url":  cluster.get("avatar_url", ""),
+        "source_ch":   cluster["source_ch"],
+        "source_lang": cluster["source_lang"],
+        "raw_forward": cluster.get("raw_forward", False),
+    }
+    for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
+        if opt_key in cluster:
+            entry[opt_key] = {str(k): v for k, v in cluster[opt_key].items()}
+    if "embed_count" in cluster:
+        entry["embed_count"] = cluster["embed_count"]
+    return entry
+
+
+def serialize_clusters(clusters: dict) -> dict:
+    """Snapshot clusters into a JSON-ready structure, one entry per distinct
+    cluster with the message ids ("keys") that point at it. Run this on the
+    event-loop thread: clusters are shared mutable dicts, and serializing them
+    from a worker thread while handlers edit them can raise mid-iteration."""
+    entries: list[dict] = []
+    by_identity: dict[int, dict] = {}
     for msg_id, cluster in clusters.items():
-        entry: dict = {
-            "channels":    {str(k): v for k, v in cluster["channels"].items()},
-            "contents":    {str(k): v for k, v in cluster["contents"].items()},
-            "author":      cluster.get("author", ""),
-            "avatar_url":  cluster.get("avatar_url", ""),
-            "source_ch":   cluster["source_ch"],
-            "source_lang": cluster["source_lang"],
-            "raw_forward": cluster.get("raw_forward", False),
-        }
-        for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
-            if opt_key in cluster:
-                entry[opt_key] = {str(k): v for k, v in cluster[opt_key].items()}
-        if "embed_count" in cluster:
-            entry["embed_count"] = cluster["embed_count"]
-        serialized[str(msg_id)] = entry
+        entry = by_identity.get(id(cluster))
+        if entry is None:
+            entry = _serialize_cluster(cluster)
+            entry["keys"] = []
+            by_identity[id(cluster)] = entry
+            entries.append(entry)
+        entry["keys"].append(msg_id)
+    return {"version": CLUSTERS_FORMAT_VERSION, "clusters": entries}
+
+
+def write_clusters(serialized: dict) -> None:
     atomic_write_json(CLUSTERS_FILE, serialized, skip_if_unchanged=True)
 
 
+def save_clusters(clusters: dict) -> None:
+    write_clusters(serialize_clusters(clusters))
+
+
+def _cluster_from_entry(entry: dict) -> dict:
+    cluster: dict = {
+        "channels":    _int_key_dict(entry["channels"]),
+        "contents":    _int_key_dict(entry["contents"]),
+        "author":      entry.get("author", ""),
+        "avatar_url":  entry.get("avatar_url", ""),
+        "source_ch":   int(entry["source_ch"]),
+        "source_lang": entry["source_lang"],
+        "raw_forward": entry.get("raw_forward", False),
+    }
+    for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
+        if opt_key in entry:
+            cluster[opt_key] = _int_key_dict(entry[opt_key])
+    if "embed_count" in entry:
+        cluster["embed_count"] = entry["embed_count"]
+    return cluster
+
+
+def _clusters_from_raw(raw: dict) -> dict:
+    result: dict = {}
+    if "version" in raw:
+        if raw["version"] != CLUSTERS_FORMAT_VERSION:
+            raise ValueError(f"unsupported clusters format {raw['version']!r}")
+        for entry in raw["clusters"]:
+            cluster = _cluster_from_entry(entry)
+            for msg_id in entry["keys"]:
+                result[int(msg_id)] = cluster
+        return result
+    # Legacy format: one full copy of the cluster per message id. Copies that
+    # are identical were one shared dict before the save, so re-share them —
+    # otherwise an edit through one channel's copy never reaches the others.
+    shared: dict[str, dict] = {}
+    for msg_id_str, entry in raw.items():
+        signature = json.dumps(entry, sort_keys=True)
+        cluster = shared.get(signature)
+        if cluster is None:
+            cluster = shared[signature] = _cluster_from_entry(entry)
+        result[int(msg_id_str)] = cluster
+    return result
+
+
 def load_clusters() -> dict:
+    """Returns {msg_id: cluster}; every id of one forwarded message maps to the
+    same dict object, as in the live bot."""
     if not os.path.exists(CLUSTERS_FILE):
         return {}
     try:
         with open(CLUSTERS_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        result: dict = {}
-        for msg_id_str, entry in raw.items():
-            cluster: dict = {
-                "channels":    _int_key_dict(entry["channels"]),
-                "contents":    _int_key_dict(entry["contents"]),
-                "author":      entry.get("author", ""),
-                "avatar_url":  entry.get("avatar_url", ""),
-                "source_ch":   int(entry["source_ch"]),
-                "source_lang": entry["source_lang"],
-                "raw_forward": entry.get("raw_forward", False),
-            }
-            for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
-                if opt_key in entry:
-                    cluster[opt_key] = _int_key_dict(entry[opt_key])
-            if "embed_count" in entry:
-                cluster["embed_count"] = entry["embed_count"]
-            result[int(msg_id_str)] = cluster
-        return result
+        return _clusters_from_raw(raw)
     except OSError:
         return {}
-    except (json.JSONDecodeError, ValueError, KeyError):
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
         quarantine_corrupt(CLUSTERS_FILE)
         return {}
 
 
-def save_thread_clusters(thread_clusters: dict) -> None:
-    serialized = {
+def serialize_thread_clusters(thread_clusters: dict) -> dict:
+    return {
         str(tid): {str(k): v for k, v in mapping.items()}
         for tid, mapping in thread_clusters.items()
     }
+
+
+def write_thread_clusters(serialized: dict) -> None:
     atomic_write_json(THREAD_CLUSTERS_FILE, serialized, skip_if_unchanged=True)
+
+
+def save_thread_clusters(thread_clusters: dict) -> None:
+    write_thread_clusters(serialize_thread_clusters(thread_clusters))
 
 
 def load_thread_clusters() -> dict:
@@ -146,9 +205,16 @@ def load_thread_clusters() -> dict:
         return {}
 
 
-def save_channel_pins(channel_pins: dict) -> None:
-    serialized = {str(ch_id): sorted(pins) for ch_id, pins in channel_pins.items()}
+def serialize_channel_pins(channel_pins: dict) -> dict:
+    return {str(ch_id): sorted(pins) for ch_id, pins in channel_pins.items()}
+
+
+def write_channel_pins(serialized: dict) -> None:
     atomic_write_json(CHANNEL_PINS_FILE, serialized, skip_if_unchanged=True)
+
+
+def save_channel_pins(channel_pins: dict) -> None:
+    write_channel_pins(serialize_channel_pins(channel_pins))
 
 
 def load_channel_pins() -> dict:

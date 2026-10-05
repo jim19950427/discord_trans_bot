@@ -29,9 +29,11 @@ from glossary import (
     load_glossary, save_glossary, get_guild_glossary,
     load_substitutions, save_substitutions, get_guild_substitutions,
     load_user_langs, save_user_langs,
-    save_clusters, load_clusters,
+    save_clusters, load_clusters, serialize_clusters, write_clusters,
     save_thread_clusters, load_thread_clusters,
+    serialize_thread_clusters, write_thread_clusters,
     save_channel_pins, load_channel_pins,
+    serialize_channel_pins, write_channel_pins,
     save_pending_retries, load_pending_retries,
 )
 
@@ -163,9 +165,25 @@ def _store_cluster(cluster: dict) -> None:
     for msg_id in cluster["channels"].values():
         _msg_clusters[msg_id] = cluster
     if len(_msg_clusters) > _MAX_CLUSTER_ENTRIES:
-        remove_keys = list(_msg_clusters.keys())[: _MAX_CLUSTER_ENTRIES // 3]
-        for k in remove_keys:
-            del _msg_clusters[k]
+        _evict_clusters(_MAX_CLUSTER_ENTRIES * 9 // 10, keep=cluster)
+
+
+def _evict_clusters(target: int, keep: dict | None = None) -> None:
+    """Drop whole clusters, oldest first, until at most `target` ids remain.
+
+    Evicting a cluster removes every id that points at it, so a message is
+    either fully editable or fully forgotten — never half-tracked. Stopping at
+    90% of the cap (rather than the cap itself) avoids re-running this on
+    every new message once the store is full."""
+    for key in list(_msg_clusters):
+        if len(_msg_clusters) <= target:
+            break
+        cluster = _msg_clusters.get(key)
+        if cluster is None or cluster is keep:
+            continue
+        for k in [key, *cluster["channels"].values()]:
+            if _msg_clusters.get(k) is cluster:
+                del _msg_clusters[k]
 
 
 def _group_channels(guild_channels: dict, channel_id: int) -> dict:
@@ -223,11 +241,26 @@ def _guild_channels_for(channel_id: int) -> dict:
 # Cluster persistence
 # ---------------------------------------------------------------------------
 
+async def _persist_one(name: str, snapshot, write) -> None:
+    try:
+        await asyncio.to_thread(write, snapshot())
+    except Exception as e:
+        log_event(f"Failed to persist {name}: {type(e).__name__}: {e}", type="error")
+
+
 @tasks.loop(seconds=60)
 async def _persist_clusters():
-    await asyncio.to_thread(save_clusters, dict(_msg_clusters))
-    await asyncio.to_thread(save_thread_clusters, dict(_thread_clusters))
-    await asyncio.to_thread(save_channel_pins, dict(_channel_pins))
+    # Snapshot on the event loop (no handler can mutate the shared cluster
+    # dicts mid-serialization); only the disk write runs in a thread. Each file
+    # is isolated: an unhandled exception here would stop this loop for good
+    # and silently lose every cluster until the next restart.
+    await _persist_one("msg clusters", lambda: serialize_clusters(_msg_clusters), write_clusters)
+    await _persist_one(
+        "thread clusters", lambda: serialize_thread_clusters(_thread_clusters), write_thread_clusters
+    )
+    await _persist_one(
+        "channel pins", lambda: serialize_channel_pins(_channel_pins), write_channel_pins
+    )
 
 
 @bot.event
@@ -327,6 +360,8 @@ async def on_ready():
                     _channel_pins[ch_id] = set()
 
     _msg_clusters.update(load_clusters())
+    if len(_msg_clusters) > _MAX_CLUSTER_ENTRIES:
+        _evict_clusters(_MAX_CLUSTER_ENTRIES * 9 // 10)
     _thread_clusters.update(load_thread_clusters())
     saved_pins = load_channel_pins()
     for ch_id, pin_set in saved_pins.items():
