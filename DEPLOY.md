@@ -79,7 +79,7 @@ DISCORD_TOKEN=你的Bot_Token貼在這裡
 # TRANSLATE_CACHE_SIZE_LIMIT=52428800         ← 翻譯快取容量上限，單位 bytes（預設 50MB，超過時自動淘汰最少使用的項目）
 # BOT_LOG_FILE=/data/bot_log.jsonl      ← 機器人運作紀錄檔（JSON Lines，每行一筆），涵蓋翻譯呼叫與所有錯誤/事件訊息，方便除錯查詢
 # BOT_LOG_MAX_ENTRIES=5000             ← 紀錄檔上限筆數（預設 5000，超過時自動淘汰最舊的紀錄）
-# ALERT_CHANNEL_ID=123456789012345678  ← 告警頻道 ID（預設關閉）。設定後，機器人發生錯誤（log 的 type=error）或被看門狗自動重啟時，會在該頻道發一則訊息
+# ALERT_CHANNEL_ID=123456789012345678  ← 告警頻道 ID（預設關閉）。設定後，機器人發生錯誤（log 的 type=error）、翻譯服務的斷路器開啟、或被看門狗自動重啟時，會在該頻道發一則訊息
 # ALERT_MIN_INTERVAL_SECONDS=600      ← 同類告警的最短間隔（預設 600 秒）
 # ALERT_MAX_PER_HOUR=6                ← 每小時告警上限（預設 6 則，超過的會合併計數）
 ```

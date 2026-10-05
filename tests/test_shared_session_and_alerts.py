@@ -203,3 +203,59 @@ def test_restart_reason_is_announced_once_then_cleared(tmp_path, monkeypatch):
     assert send.await_count == 1
     assert "gateway not ready" in send.await_args.args[0]
     assert not reason_file.exists()
+
+
+# ---- review fixes --------------------------------------------------------
+
+def test_alert_is_sent_without_any_mentions(monkeypatch):
+    channel = SimpleNamespace(send=AsyncMock())
+    monkeypatch.setattr(bot_module, "ALERT_CHANNEL_ID", 555)
+    monkeypatch.setattr(bot_module.bot, "get_channel", lambda _id: channel)
+
+    run(bot_module._send_alert("@everyone hi"))
+
+    kwargs = channel.send.await_args.kwargs
+    assert kwargs["allowed_mentions"].everyone is False
+    assert kwargs["allowed_mentions"].users is False and kwargs["allowed_mentions"].roles is False
+
+
+@pytest.mark.parametrize("raw", ["#alerts", "12 34", "abc"])
+def test_invalid_channel_id_env_is_treated_as_unset(monkeypatch, raw):
+    monkeypatch.setenv("ALERT_CHANNEL_ID", raw)
+    assert bot_module._env_channel_id("ALERT_CHANNEL_ID") == 0
+    monkeypatch.setenv("ALERT_CHANNEL_ID", "123456")
+    assert bot_module._env_channel_id("ALERT_CHANNEL_ID") == 123456
+
+
+def test_open_provider_circuit_triggers_the_hook_but_other_provider_events_do_not(tmp_path, monkeypatch):
+    monkeypatch.setattr(translator, "LOG_FILE", str(tmp_path / "log.jsonl"))
+    calls = []
+    translator.set_error_hook(lambda msg, fields: calls.append(fields))
+    try:
+        translator.log_event("ok", type="translate_provider", provider="azure", circuit_state="closed")
+        translator.log_event("down", type="translate_provider", provider="azure", circuit_state="open")
+    finally:
+        translator.set_error_hook(None)
+
+    assert [c["circuit_state"] for c in calls] == ["open"]
+    assert calls[0]["type"] == "translate_provider"
+
+
+def test_provider_circuit_alert_is_a_readable_message_without_provider_internals(monkeypatch):
+    sent = []
+    monkeypatch.setattr(bot_module, "ALERT_CHANNEL_ID", 555)
+    monkeypatch.setattr(bot_module, "_alert_limiter", bot_module._AlertLimiter(600, 10))
+    monkeypatch.setattr(bot_module, "_send_alert", AsyncMock(side_effect=lambda t: sent.append(t)))
+
+    async def scenario():
+        monkeypatch.setattr(bot_module, "_alert_loop", asyncio.get_running_loop())
+        for _ in range(3):  # open-circuit events repeat; only one alert may go out
+            bot_module._error_alert_hook(
+                "[translate_provider] azure en->ja success=False",
+                {"type": "translate_provider", "provider": "azure", "circuit_state": "open"},
+            )
+        await asyncio.sleep(0.05)
+
+    run(scenario())
+
+    assert len(sent) == 1 and "azure" in sent[0] and "斷路器" in sent[0]

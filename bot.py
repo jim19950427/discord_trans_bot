@@ -176,7 +176,16 @@ def _get_http_session() -> aiohttp.ClientSession:
 # Off unless ALERT_CHANNEL_ID is set in .env. The heartbeat/healthcheck only
 # shows state in Container Manager; this tells the operator without them
 # having to look.
-ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0") or 0)
+def _env_channel_id(name: str) -> int:
+    """A typo in .env must not crash-loop the container; treat it as unset."""
+    try:
+        return int(os.getenv(name, "0") or 0)
+    except ValueError:
+        print(f"[config] {name} is not a number — alerts disabled")
+        return 0
+
+
+ALERT_CHANNEL_ID = _env_channel_id("ALERT_CHANNEL_ID")
 ALERT_MIN_INTERVAL_SECONDS = float(os.getenv("ALERT_MIN_INTERVAL_SECONDS", "600"))
 ALERT_MAX_PER_HOUR = int(os.getenv("ALERT_MAX_PER_HOUR", "6"))
 RESTART_REASON_FILE = os.getenv("RESTART_REASON_FILE", "/data/last_restart_reason")
@@ -229,7 +238,7 @@ async def _send_alert(text: str) -> None:
         return
     try:
         channel = bot.get_channel(ALERT_CHANNEL_ID) or await bot.fetch_channel(ALERT_CHANNEL_ID)
-        await channel.send(text)
+        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         # type="info" on purpose: an error here would re-enter the alert hook.
         log_event(f"Alert delivery failed: {type(e).__name__}")
@@ -240,7 +249,12 @@ def _error_alert_hook(message: str, fields: dict) -> None:
     loop = _alert_loop
     if not ALERT_CHANNEL_ID or loop is None or loop.is_closed():
         return
-    key = message.split(":", 1)[0][:60]
+    if fields.get("type") == "translate_provider":
+        provider = fields.get("provider", "?")
+        key = f"provider-circuit-open:{provider}"
+        message = f"翻譯服務 {provider} 的斷路器已開啟（暫停呼叫，改用備援或回傳原文）"
+    else:
+        key = message.split(":", 1)[0][:60]
     allowed, suppressed = _alert_limiter.allow(key, time.monotonic())
     if not allowed:
         return
