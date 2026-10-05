@@ -85,7 +85,7 @@ def _serialize_cluster(cluster: dict) -> dict:
         "source_lang": cluster["source_lang"],
         "raw_forward": cluster.get("raw_forward", False),
     }
-    for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
+    for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls", "extra_parts"):
         if opt_key in cluster:
             entry[opt_key] = {str(k): v for k, v in cluster[opt_key].items()}
     if "embed_count" in cluster:
@@ -129,7 +129,7 @@ def _cluster_from_entry(entry: dict) -> dict:
         "source_lang": entry["source_lang"],
         "raw_forward": entry.get("raw_forward", False),
     }
-    for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls"):
+    for opt_key in ("thread_channels", "prefixes", "att_names", "att_urls", "extra_parts"):
         if opt_key in entry:
             cluster[opt_key] = _int_key_dict(entry[opt_key])
     if "embed_count" in entry:
@@ -261,4 +261,6 @@ def load_pending_retries() -> list[dict]:
         if isinstance(entry, dict)
         and all(isinstance(entry.get(k), t) for k, t in required.items())
         and isinstance(entry.get("prefix", ""), str)
+        and isinstance(entry.get("extra_ids", []), list)
+        and all(isinstance(i, int) for i in entry.get("extra_ids", []))
     ]

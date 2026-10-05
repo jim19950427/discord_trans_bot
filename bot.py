@@ -110,15 +110,94 @@ class _ForwardResult:
     message_id: int
     text: str
     translation_succeeded: bool
+    # Ids of continuation messages when the content had to be split to fit
+    # Discord's 2000-character limit (message_id is always the first part).
+    extra_ids: tuple[int, ...] = ()
 
     def __iter__(self):
         yield self.message_id
         yield self.text
 
+DISCORD_MESSAGE_LIMIT = 2000
+_FENCE = "```"
+
+
+def _discord_len(text: str) -> int:
+    """Length as Discord appears to count it: characters outside the BMP (most
+    emoji) take two units, so budget for them to stay safely under the limit."""
+    return len(text) + sum(1 for ch in text if ord(ch) > 0xFFFF)
+
+
+def _split_message(content: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split content into parts that each fit in one Discord message.
+
+    Prefers breaking at a newline, then a space, then anywhere. A part that
+    ends inside a ``` code block is closed and the next part reopens it, so the
+    rest of the message is not rendered as code."""
+    if _discord_len(content) <= limit:
+        return [content]
+    chunks: list[str] = []
+    reopen = ""
+    rest = content
+    while True:
+        text = reopen + rest
+        if _discord_len(text) <= limit:
+            chunks.append(text)
+            break
+        budget = limit - len(_FENCE) - 1  # room to close an open code fence
+        cut = text.rfind("\n", 0, budget)
+        skip = 1
+        if cut <= len(reopen):
+            cut = text.rfind(" ", 0, budget)
+        if cut <= len(reopen):
+            cut, skip = budget, 0
+        while cut > len(reopen) + 1 and _discord_len(text[:cut]) > budget:
+            cut -= 1
+            skip = 0  # no longer on a separator: don't drop a real character
+        head, rest = text[:cut], text[cut + skip:]
+        if head.count(_FENCE) % 2:
+            head += "\n" + _FENCE
+            reopen = _FENCE + "\n"
+        else:
+            reopen = ""
+        chunks.append(head)
+    return chunks
+
+
+def _cluster_messages(cluster: dict) -> list[tuple[int, int]]:
+    """Every (channel_id, message_id) of a cluster, including the continuation
+    messages of split long posts."""
+    pairs = list(cluster["channels"].items())
+    for ch_id, ids in cluster.get("extra_parts", {}).items():
+        pairs.extend((ch_id, mid) for mid in ids)
+    return pairs
+
+
+def _unpack_forward(result) -> tuple[int, str, tuple[int, ...]]:
+    message_id, text = result
+    return message_id, text, tuple(getattr(result, "extra_ids", ()))
+
+
+def _record_forward(cluster: dict, ch_id: int, result) -> str:
+    """Store a send result in the cluster; returns the delivered text."""
+    message_id, text, extras = _unpack_forward(result)
+    cluster["channels"][ch_id] = message_id
+    extra_parts = cluster.setdefault("extra_parts", {})
+    if extras:
+        extra_parts[ch_id] = list(extras)
+    else:
+        extra_parts.pop(ch_id, None)
+    if not extra_parts:
+        del cluster["extra_parts"]
+    return text or ""
+
+
 # msg_id -> cluster dict shared by all messages in a translation group
 # cluster keys:
 #   channels       {channel_id: msg_id}
 #   contents       {channel_id: translated_text}
+#   extra_parts    {channel_id: [msg_id, ...]}  continuation messages of a post split to fit 2000 chars
+#                  (channels[ch] is always the first part; use _cluster_messages() for every id)
 #   author         display name of the original sender
 #   avatar_url     avatar URL (needed for delete+resend on attachment edit)
 #   source_ch      channel_id of the original message
@@ -277,7 +356,7 @@ _pending_retries: dict[str, dict] = {}
 
 
 def _store_cluster(cluster: dict) -> None:
-    for msg_id in cluster["channels"].values():
+    for _, msg_id in _cluster_messages(cluster):
         _msg_clusters[msg_id] = cluster
     if len(_msg_clusters) > _MAX_CLUSTER_ENTRIES:
         _evict_clusters(_MAX_CLUSTER_ENTRIES * 9 // 10, keep=cluster)
@@ -296,7 +375,7 @@ def _evict_clusters(target: int, keep: dict | None = None) -> None:
         cluster = _msg_clusters.get(key)
         if cluster is None or cluster is keep:
             continue
-        for k in [key, *cluster["channels"].values()]:
+        for k in [key, *(mid for _, mid in _cluster_messages(cluster))]:
             if _msg_clusters.get(k) is cluster:
                 del _msg_clusters[k]
 
@@ -676,9 +755,7 @@ async def on_message(message: discord.Message):
     }
     for ch_id, tid, result in zip(target_channel_ids, target_thread_ids, results):
         if result is not None:
-            sent_id, sent_text = result
-            cluster["channels"][ch_id] = sent_id
-            cluster["contents"][ch_id] = sent_text or ""
+            cluster["contents"][ch_id] = _record_forward(cluster, ch_id, result)
             cluster["att_names"][ch_id] = [a.filename for a in attachments]
             cluster["att_urls"][ch_id] = [a.url for a in attachments]
             if tid is not None:
@@ -722,6 +799,7 @@ async def on_message(message: discord.Message):
                     normalize_lang(guild_channels[ch_id]["lang"]),
                     message.guild.id, ch_id, sent_id,
                     prefix=cluster.get("prefixes", {}).get(ch_id, ""),
+                    extra_ids=cluster.get("extra_parts", {}).get(ch_id, ()),
                 )
 
 
@@ -799,9 +877,14 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     attachments_changed = prev_att_names != curr_att_names
 
     if attachments_changed:
+        old_extras = {
+            ch_id: list(cluster.get("extra_parts", {}).get(ch_id, []))
+            for ch_id, *_ in edit_targets
+        }
         await asyncio.gather(*[
-            _delete_webhook_message(wh_url, msg_id, ch_id)
+            _delete_webhook_message(wh_url, mid, ch_id)
             for ch_id, msg_id, _, wh_url in edit_targets
+            for mid in [msg_id, *old_extras[ch_id]]
         ])
 
         outcomes = (
@@ -836,13 +919,23 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         cluster["raw_forward"] = raw_forward
         cluster["att_names"][source_ch_id] = curr_att_names
         for (ch_id, old_msg_id, _, _), result in zip(edit_targets, send_results):
-            _msg_clusters.pop(old_msg_id, None)
-            if result is not None:
-                new_msg_id, translated = result
-                cluster["channels"][ch_id] = new_msg_id
-                cluster["contents"][ch_id] = translated or ""
+            for old_id in [old_msg_id, *old_extras[ch_id]]:
+                _msg_clusters.pop(old_id, None)
+            if result is None:
+                # The old continuation messages were deleted above; don't keep
+                # their ids around to 404 on later edits/deletes.
+                extra_parts = cluster.get("extra_parts", {})
+                extra_parts.pop(ch_id, None)
+                if not extra_parts:
+                    cluster.pop("extra_parts", None)
+            else:
+                cluster["contents"][ch_id] = _record_forward(cluster, ch_id, result)
                 cluster["att_names"][ch_id] = curr_att_names
-                _msg_clusters[new_msg_id] = cluster
+                for _, new_id in _cluster_messages({
+                    "channels": {ch_id: cluster["channels"][ch_id]},
+                    "extra_parts": {ch_id: cluster.get("extra_parts", {}).get(ch_id, [])},
+                }):
+                    _msg_clusters[new_id] = cluster
     elif new_content:
         outcomes = (
             await asyncio.to_thread(
@@ -884,14 +977,14 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     # yields control) and redundantly re-run this whole handler for the same
     # cluster — observed in production as the same message getting repeated
     # "already deleted" 404s.
-    for msg_id in list(cluster["channels"].values()):
+    for _, msg_id in _cluster_messages(cluster):
         _msg_clusters.pop(msg_id, None)
 
     guild_channels = _guild_channels_for(payload.channel_id)
 
     await asyncio.gather(*[
         _delete_webhook_message(guild_channels[ch_id]["webhook_url"], msg_id, ch_id)
-        for ch_id, msg_id in cluster["channels"].items()
+        for ch_id, msg_id in _cluster_messages(cluster)
         if msg_id != payload.message_id
         and ch_id in guild_channels
         and guild_channels[ch_id].get("webhook_url")
@@ -913,7 +1006,7 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
             continue
         seen_clusters.add(cluster_key)
 
-        for ch_id, cluster_msg_id in cluster["channels"].items():
+        for ch_id, cluster_msg_id in _cluster_messages(cluster):
             if cluster_msg_id in payload.message_ids:
                 continue
             info = guild_channels.get(ch_id)
@@ -921,7 +1014,7 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
                 continue
             tasks.append(_delete_webhook_message(info["webhook_url"], cluster_msg_id, ch_id))
 
-        for mid in list(cluster["channels"].values()):
+        for _, mid in _cluster_messages(cluster):
             _msg_clusters.pop(mid, None)
 
     if tasks:
@@ -1153,8 +1246,7 @@ async def _retry_translate(
     prefix = cluster.get("prefixes", {}).get(ch_id, "")
     full_content = f"{prefix}\n{translated}" if prefix else translated
     try:
-        webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
-        await webhook.edit_message(msg_id, content=full_content)
+        await _edit_message_parts(webhook_url, msg_id, ch_id, cluster, full_content)
         cluster["contents"][ch_id] = translated
         log_event(f"[retry] updated ({src}->{dest}): {repr(translated)}")
     except Exception as e:
@@ -1178,6 +1270,7 @@ async def _persist_pending_retries() -> None:
 async def _schedule_retry(
     text: str, src: str, dest: str, guild_id: int, ch_id: int, msg_id: int,
     delay: float = RETRY_DELAY_SECONDS, prefix: str = "",
+    extra_ids: tuple[int, ...] | list[int] = (),
 ) -> None:
     key = _retry_key(ch_id, msg_id)
     if key in _pending_retries:
@@ -1190,7 +1283,7 @@ async def _schedule_retry(
     entry = {
         "text": text, "src": src, "dest": dest, "guild_id": guild_id,
         "ch_id": ch_id, "msg_id": msg_id, "due": time.time() + delay,
-        "prefix": prefix,
+        "prefix": prefix, "extra_ids": list(extra_ids),
     }
     _pending_retries[key] = entry
     await _persist_pending_retries()
@@ -1216,6 +1309,10 @@ async def _run_retry(key: str) -> None:
             # restart whose cluster was never persisted. The stored prefix is
             # enough to edit the message; there is no cluster to update.
             cluster = {"prefixes": {entry["ch_id"]: entry.get("prefix", "")}, "contents": {}}
+            if entry.get("extra_ids"):
+                # Continuation messages of a split post, so the edit updates
+                # them instead of leaving the old text behind as orphans.
+                cluster["extra_parts"] = {entry["ch_id"]: list(entry["extra_ids"])}
         await _retry_translate(
             entry["text"], entry["src"], entry["dest"], info["webhook_url"],
             entry["msg_id"], entry["ch_id"], cluster,
@@ -1315,6 +1412,28 @@ async def _webhook_send(webhook_url: str, base_kwargs: dict, file_data: list):
         return await post(new_url)
 
 
+async def _send_with_parts(webhook_url: str, send_kwargs: dict, file_data: list):
+    """Send send_kwargs["content"], split into several messages if it exceeds
+    Discord's limit. The first part carries the files and thread routing is kept
+    for every part. Returns (first_message, [continuation message ids]); a
+    continuation that fails is logged and the parts sent so far are kept."""
+    chunks = _split_message(send_kwargs["content"]) if send_kwargs.get("content") else []
+    if chunks:
+        send_kwargs = {**send_kwargs, "content": chunks[0]}
+    first = await _webhook_send(webhook_url, send_kwargs, file_data)
+    extra_ids: list[int] = []
+    for index, chunk in enumerate(chunks[1:], start=2):
+        part_kwargs = {k: v for k, v in send_kwargs.items() if k != "content"}
+        part_kwargs["content"] = chunk
+        try:
+            part = await _webhook_send(webhook_url, part_kwargs, [])
+        except Exception as e:
+            log_event(f"[forward] part {index}/{len(chunks)} failed (author={send_kwargs.get('username')!r}): {e}")
+            break
+        extra_ids.append(part.id)
+    return first, extra_ids
+
+
 async def _raw_forward_send(
     text: str,
     webhook_url: str,
@@ -1364,8 +1483,8 @@ async def _raw_forward_send(
         send_kwargs["thread"] = discord.Object(id=thread_id)
 
     try:
-        msg = await _webhook_send(webhook_url, send_kwargs, file_data)
-        return msg.id, text or ""
+        msg, extra_ids = await _send_with_parts(webhook_url, send_kwargs, file_data)
+        return _ForwardResult(msg.id, text or "", True, tuple(extra_ids))
     except Exception as e:
         # Never log webhook_url — it embeds the webhook's auth token.
         log_event(f"[forward] send failed (author={username!r}, files={len(file_data)}): {e}")
@@ -1424,11 +1543,12 @@ async def _send_pretranslated(
         send_kwargs["thread"] = discord.Object(id=thread_id)
 
     try:
-        msg = await _webhook_send(webhook_url, send_kwargs, file_data)
+        msg, extra_ids = await _send_with_parts(webhook_url, send_kwargs, file_data)
         return _ForwardResult(
             msg.id,
             translated or "",
             outcome.provider_succeeded,
+            tuple(extra_ids),
         )
     except Exception as e:
         # Never log webhook_url — it embeds the webhook's auth token.
@@ -1485,8 +1605,7 @@ async def _edit_pretranslated(
     full_content = f"{prefix}\n{translated}" if prefix else translated
 
     try:
-        webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
-        await webhook.edit_message(msg_id, content=full_content)
+        await _edit_message_parts(webhook_url, msg_id, ch_id, cluster, full_content)
     except Exception as e:
         log_event(f"Failed to edit webhook message {msg_id} in channel {ch_id}: {e}")
         return None
@@ -1511,6 +1630,44 @@ async def _translate_and_edit(
         text, src, dest, glossary or {}, substitutions or {},
     )
     return await _edit_pretranslated(outcome, webhook_url, msg_id, ch_id, cluster)
+
+
+async def _edit_message_parts(
+    webhook_url: str, msg_id: int, ch_id: int, cluster: dict, full_content: str
+) -> None:
+    """Edit a mirrored message in place, growing or shrinking its continuation
+    messages when the new content needs more or fewer parts. Raises on failure;
+    the cluster's extra_parts always reflects what actually exists."""
+    chunks = _split_message(full_content)
+    extra_parts = cluster.setdefault("extra_parts", {})
+    extras = extra_parts.setdefault(ch_id, [])
+    ids = [msg_id, *extras]
+    try:
+        webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
+        for index, chunk in enumerate(chunks):
+            if index < len(ids):
+                await webhook.edit_message(ids[index], content=chunk)
+                continue
+            kwargs: dict = {
+                "content": chunk, "wait": True,
+                "username": cluster.get("author", ""),
+                "avatar_url": cluster.get("avatar_url", ""),
+            }
+            thread_id = cluster.get("thread_channels", {}).get(ch_id)
+            if thread_id:
+                kwargs["thread"] = discord.Object(id=thread_id)
+            part = await _webhook_send(webhook_url, kwargs, [])
+            extras.append(part.id)
+            _msg_clusters[part.id] = cluster
+        for surplus in ids[len(chunks):]:
+            extras.remove(surplus)
+            _msg_clusters.pop(surplus, None)
+            await _delete_webhook_message(webhook_url, surplus, ch_id)
+    finally:
+        if not extras:
+            extra_parts.pop(ch_id, None)
+        if not extra_parts:
+            cluster.pop("extra_parts", None)
 
 
 async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> None:
@@ -1616,9 +1773,7 @@ async def _retry_missing_channels(cluster: dict, guild_id: int) -> tuple[list[in
         if result is None:
             failed.append(ch_id)
             continue
-        sent_id, sent_text = result
-        cluster["channels"][ch_id] = sent_id
-        cluster["contents"][ch_id] = sent_text or ""
+        cluster["contents"][ch_id] = _record_forward(cluster, ch_id, result)
         cluster["att_names"][ch_id] = cluster.get("att_names", {}).get(source_ch_id, [])
         cluster["att_urls"][ch_id] = cluster.get("att_urls", {}).get(source_ch_id, [])
         if thread_map is not None:
@@ -1663,8 +1818,7 @@ async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_i
     prefix = cluster.get("prefixes", {}).get(parent_ch_id, "")
     full_content = f"{prefix}\n{translated}" if prefix else translated
     try:
-        webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
-        await webhook.edit_message(msg_id, content=full_content)
+        await _edit_message_parts(webhook_url, msg_id, parent_ch_id, cluster, full_content)
         cluster["contents"][parent_ch_id] = translated
         log_event(f"[retranslate] ({source_lang}->{target_lang}) updated msg={msg_id}")
         return translated
