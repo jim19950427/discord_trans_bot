@@ -568,11 +568,16 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
     cluster = _msg_clusters.get(payload.message_id)
     if not cluster:
+        log_event(
+            f"Edit ignored: message {payload.message_id} in channel "
+            f"{payload.channel_id} has no cluster (too old, evicted or never forwarded)"
+        )
         return
 
     try:
         message = await channel.fetch_message(payload.message_id)
-    except (discord.NotFound, discord.HTTPException):
+    except (discord.NotFound, discord.HTTPException) as e:
+        log_event(f"Edit ignored: cannot fetch message {payload.message_id}: {type(e).__name__}")
         return
 
     if message.author.bot:
