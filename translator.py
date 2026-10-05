@@ -152,6 +152,17 @@ def _trim_log(path: str) -> int:
     return len(lines)
 
 
+_error_hook = None
+
+
+def set_error_hook(hook) -> None:
+    """Register `hook(message, fields)` to be called (from any thread) for every
+    logged type="error" event and every provider event with an open circuit
+    breaker; `fields["type"]` tells them apart. Used by the bot for alerts."""
+    global _error_hook
+    _error_hook = hook
+
+
 def log_event(message: str, **fields) -> None:
     """Print message to the console (unchanged, still visible in the DSM log
     viewer) and also append a structured entry to a shared JSON-lines log file
@@ -183,6 +194,16 @@ def log_event(message: str, **fields) -> None:
             _log_counts[path] = count
         except OSError as e:
             print(f"[log write failed] {e}")
+    # Provider outages are logged as translate_provider events (not errors):
+    # the breaker tripping is what an operator needs to hear about.
+    alertable = entry["type"] == "error" or (
+        entry["type"] == "translate_provider" and fields.get("circuit_state") == "open"
+    )
+    if alertable and _error_hook is not None:
+        try:
+            _error_hook(message, {**fields, "type": entry["type"]})
+        except Exception as e:  # an alert problem must never break logging
+            print(f"[error hook failed] {e}")
 
 
 def _get_provider_chain() -> TranslationProviderChain:

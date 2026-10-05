@@ -2,6 +2,7 @@ import os
 import io
 import time
 import json
+import re
 import threading
 import asyncio
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from translator import (
     normalize_lang,
     has_translatable_content,
     log_event,
+    set_error_hook,
 )
 from config import (
     CONFIG_FILE, atomic_write_json, cleanup_stale_tmp,
@@ -147,6 +149,119 @@ def _on_background_done(task: asyncio.Task) -> None:
         log_event(f"[background] task failed: {task.exception()!r}", type="error")
 
 
+# One shared HTTP session for every webhook call and attachment download.
+# A session per call meant a fresh TCP+TLS handshake for each of the (up to 8)
+# channels of a fan-out. Bound to the loop that created it; re-created if that
+# loop is gone (tests run each case in its own loop).
+_http_session: aiohttp.ClientSession | None = None
+_http_session_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_http_session() -> aiohttp.ClientSession:
+    global _http_session, _http_session_loop
+    loop = asyncio.get_running_loop()
+    if (
+        _http_session is None
+        or getattr(_http_session, "closed", False)
+        or _http_session_loop is not loop
+    ):
+        _http_session = aiohttp.ClientSession()
+        _http_session_loop = loop
+    return _http_session
+
+
+# ---------------------------------------------------------------------------
+# Alerts: type="error" log events -> an optional Discord channel
+# ---------------------------------------------------------------------------
+# Off unless ALERT_CHANNEL_ID is set in .env. The heartbeat/healthcheck only
+# shows state in Container Manager; this tells the operator without them
+# having to look.
+def _env_channel_id(name: str) -> int:
+    """A typo in .env must not crash-loop the container; treat it as unset."""
+    try:
+        return int(os.getenv(name, "0") or 0)
+    except ValueError:
+        print(f"[config] {name} is not a number — alerts disabled")
+        return 0
+
+
+ALERT_CHANNEL_ID = _env_channel_id("ALERT_CHANNEL_ID")
+ALERT_MIN_INTERVAL_SECONDS = float(os.getenv("ALERT_MIN_INTERVAL_SECONDS", "600"))
+ALERT_MAX_PER_HOUR = int(os.getenv("ALERT_MAX_PER_HOUR", "6"))
+RESTART_REASON_FILE = os.getenv("RESTART_REASON_FILE", "/data/last_restart_reason")
+_WEBHOOK_URL_RE = re.compile(r"https?://\S*/api/webhooks/\S+", re.IGNORECASE)
+
+
+class _AlertLimiter:
+    """Same alert key at most once per `min_interval`, and at most `max_per_hour`
+    alerts overall, so one failing loop can't flood the channel. Suppressed
+    alerts are counted and reported with the next one that gets through."""
+
+    def __init__(self, min_interval: float, max_per_hour: int):
+        self.min_interval = min_interval
+        self.max_per_hour = max_per_hour
+        self._last: dict[str, float] = {}
+        self._sent: list[float] = []
+        self._suppressed = 0
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, now: float) -> tuple[bool, int]:
+        with self._lock:
+            return self._allow(key, now)
+
+    def _allow(self, key: str, now: float) -> tuple[bool, int]:
+        self._sent = [t for t in self._sent if now - t < 3600]
+        last = self._last.get(key)
+        if (last is not None and now - last < self.min_interval) or len(self._sent) >= self.max_per_hour:
+            self._suppressed += 1
+            return False, 0
+        self._last[key] = now
+        self._sent.append(now)
+        suppressed, self._suppressed = self._suppressed, 0
+        return True, suppressed
+
+
+_alert_limiter = _AlertLimiter(ALERT_MIN_INTERVAL_SECONDS, ALERT_MAX_PER_HOUR)
+_alert_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _alert_text(message: str, suppressed: int = 0) -> str:
+    text = _WEBHOOK_URL_RE.sub("<webhook>", message)
+    if len(text) > 300:
+        text = text[:297] + "..."
+    note = f"\n（另有 {suppressed} 則同類告警被略過）" if suppressed else ""
+    return f"⚠️ 翻譯機器人錯誤：{text}{note}"
+
+
+async def _send_alert(text: str) -> None:
+    if not ALERT_CHANNEL_ID:
+        return
+    try:
+        channel = bot.get_channel(ALERT_CHANNEL_ID) or await bot.fetch_channel(ALERT_CHANNEL_ID)
+        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        # type="info" on purpose: an error here would re-enter the alert hook.
+        log_event(f"Alert delivery failed: {type(e).__name__}")
+
+
+def _error_alert_hook(message: str, fields: dict) -> None:
+    """Called from log_event (any thread) for every type="error" event."""
+    loop = _alert_loop
+    if not ALERT_CHANNEL_ID or loop is None or loop.is_closed():
+        return
+    if fields.get("type") == "translate_provider":
+        provider = fields.get("provider", "?")
+        key = f"provider-circuit-open:{provider}"
+        message = f"翻譯服務 {provider} 的斷路器已開啟（暫停呼叫，改用備援或回傳原文）"
+    else:
+        key = message.split(":", 1)[0][:60]
+    allowed, suppressed = _alert_limiter.allow(key, time.monotonic())
+    if not allowed:
+        return
+    text = _alert_text(message, suppressed)
+    loop.call_soon_threadsafe(lambda: _spawn(_send_alert(text)))
+
+
 def _spawn(coro) -> asyncio.Task:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
@@ -268,6 +383,8 @@ async def on_close():
     save_clusters(_msg_clusters)
     save_thread_clusters(_thread_clusters)
     save_channel_pins(_channel_pins)
+    if _http_session is not None and not _http_session.closed:
+        await _http_session.close()
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +443,11 @@ def _watchdog():
         reason = _watchdog_verdict(now, _last_loop_beat, not_ready_since)
         if reason:
             log_event(f"[watchdog] {reason} — restarting")
+            try:
+                with open(RESTART_REASON_FILE, "w", encoding="utf-8") as f:
+                    f.write(reason)
+            except OSError:
+                pass
             os._exit(1)
 
 
@@ -336,13 +458,15 @@ def _watchdog():
 @bot.event
 async def on_ready():
     global channel_configs, _glossary_data, _substitutions_data, _user_langs_data
-    global _startup_done
+    global _startup_done, _alert_loop
     if _startup_done:
         # on_ready fires again after a gateway reconnect. Re-running the
         # restore below would overwrite live in-memory clusters (and break
         # their shared identity) with the last on-disk snapshot.
         log_event("Gateway reconnected (on_ready fired again) — state kept")
         return
+    _alert_loop = asyncio.get_running_loop()
+    set_error_hook(_error_alert_hook)
     channel_configs = load_channel_config()
     _glossary_data = load_glossary()
     _substitutions_data = load_substitutions()
@@ -390,6 +514,21 @@ async def on_ready():
     except Exception as _e:
         print(f"[status write failed] {_e}")
     _startup_done = True
+    await _announce_watchdog_restart()
+
+
+async def _announce_watchdog_restart() -> None:
+    """The watchdog leaves its reason in RESTART_REASON_FILE just before
+    exiting; report it once, then clear it. Ordinary restarts (deploys) leave
+    no file and stay silent."""
+    try:
+        with open(RESTART_REASON_FILE, "r", encoding="utf-8") as f:
+            reason = f.read().strip()
+        os.remove(RESTART_REASON_FILE)
+    except OSError:
+        return
+    if reason:
+        await _send_alert(f"🔄 翻譯機器人已由看門狗自動重啟：{reason}")
 
 
 # ---------------------------------------------------------------------------
@@ -646,9 +785,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         cluster["embed_count"] = len(current_embeds)
         for ch_id, msg_id, _, wh_url in edit_targets:
             try:
-                async with aiohttp.ClientSession() as session:
-                    webhook = discord.Webhook.from_url(wh_url, session=session)
-                    await webhook.edit_message(msg_id, embeds=current_embeds)
+                webhook = discord.Webhook.from_url(wh_url, session=_get_http_session())
+                await webhook.edit_message(msg_id, embeds=current_embeds)
             except Exception as e:
                 log_event(f"Failed to forward embeds to channel {ch_id}: {e}")
 
@@ -1015,9 +1153,8 @@ async def _retry_translate(
     prefix = cluster.get("prefixes", {}).get(ch_id, "")
     full_content = f"{prefix}\n{translated}" if prefix else translated
     try:
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(webhook_url, session=session)
-            await webhook.edit_message(msg_id, content=full_content)
+        webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
+        await webhook.edit_message(msg_id, content=full_content)
         cluster["contents"][ch_id] = translated
         log_event(f"[retry] updated ({src}->{dest}): {repr(translated)}")
     except Exception as e:
@@ -1163,9 +1300,8 @@ async def _webhook_send(webhook_url: str, base_kwargs: dict, file_data: list):
         return kwargs
 
     async def post(url: str):
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(url, session=session)
-            return await webhook.send(**build())
+        webhook = discord.Webhook.from_url(url, session=_get_http_session())
+        return await webhook.send(**build())
 
     webhook_url = _healed_urls.get(webhook_url, webhook_url)
     try:
@@ -1198,11 +1334,10 @@ async def _raw_forward_send(
     )
     for url, filename in urls:
         try:
-            async with aiohttp.ClientSession() as dl:
-                async with dl.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        file_data.append((filename, data))
+            async with _get_http_session().get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    file_data.append((filename, data))
         except Exception as e:
             log_event(f"Download failed ({filename}): {e}")
 
@@ -1259,11 +1394,10 @@ async def _send_pretranslated(
     )
     for url, filename in urls:
         try:
-            async with aiohttp.ClientSession() as dl:
-                async with dl.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        file_data.append((filename, data))
+            async with _get_http_session().get(url) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    file_data.append((filename, data))
         except Exception as e:
             log_event(f"Download failed ({filename}): {e}")
 
@@ -1351,9 +1485,8 @@ async def _edit_pretranslated(
     full_content = f"{prefix}\n{translated}" if prefix else translated
 
     try:
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(webhook_url, session=session)
-            await webhook.edit_message(msg_id, content=full_content)
+        webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
+        await webhook.edit_message(msg_id, content=full_content)
     except Exception as e:
         log_event(f"Failed to edit webhook message {msg_id} in channel {ch_id}: {e}")
         return None
@@ -1382,9 +1515,8 @@ async def _translate_and_edit(
 
 async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> None:
     try:
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(webhook_url, session=session)
-            await webhook.delete_message(msg_id)
+        webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
+        await webhook.delete_message(msg_id)
     except Exception as e:
         log_event(f"Failed to delete webhook message {msg_id} in channel {ch_id}: {e}")
 
@@ -1531,9 +1663,8 @@ async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_i
     prefix = cluster.get("prefixes", {}).get(parent_ch_id, "")
     full_content = f"{prefix}\n{translated}" if prefix else translated
     try:
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(webhook_url, session=session)
-            await webhook.edit_message(msg_id, content=full_content)
+        webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
+        await webhook.edit_message(msg_id, content=full_content)
         cluster["contents"][parent_ch_id] = translated
         log_event(f"[retranslate] ({source_lang}->{target_lang}) updated msg={msg_id}")
         return translated
