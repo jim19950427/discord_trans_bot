@@ -474,3 +474,28 @@ def test_on_message_bypasses_translation_for_raw_and_attachment_only(routing_env
         ("ko-hook", "", ["image.png"]), ("en-hook", "", ["image.png"]), ("ja-hook", "", ["image.png"]),
     ])
     assert bot_module._msg_clusters[9001]["raw_forward"] is (mode == "raw_forward")
+
+
+def test_failed_resend_after_attachment_change_forgets_deleted_continuation_parts(routing_environment, monkeypatch):
+    """Deleted continuation messages must not stay tracked when the new send fails."""
+    state = routing_environment
+    message = _message("Edited text")
+    message.attachments = [SimpleNamespace(filename="new.png", url="https://example.invalid/new.png")]
+    state.source.fetch_message.return_value = message
+    cluster = _existing_cluster()
+    cluster["extra_parts"] = {202: [7302, 7303]}
+    bot_module._store_cluster(cluster)
+    original_send = bot_module._send_pretranslated
+
+    async def fail_for_korean(outcome, lang, *args, **kwargs):
+        if lang == "ko":
+            return None
+        return await original_send(outcome, lang, *args, **kwargs)
+
+    monkeypatch.setattr(bot_module, "_send_pretranslated", fail_for_korean)
+
+    asyncio.run(bot_module.on_raw_message_edit(SimpleNamespace(channel_id=101, message_id=9001)))
+
+    assert ("ko-hook", 7302) in state.deletes and ("ko-hook", 7303) in state.deletes
+    assert "extra_parts" not in cluster
+    assert 7302 not in bot_module._msg_clusters and 7303 not in bot_module._msg_clusters

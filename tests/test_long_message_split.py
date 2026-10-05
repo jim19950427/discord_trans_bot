@@ -333,3 +333,63 @@ def test_on_message_with_a_translation_over_the_limit_posts_parts_and_tracks_the
     assert cluster["contents"][202] == long_translation   # full text kept for later edits
     # every part resolves to the same cluster, so deleting/replying to any part works
     assert all(bot_module._msg_clusters[i] is cluster for i in (9001, 5001, 5002, 5003))
+
+
+# ---- review fixes ------------------------------------------------------------
+
+def test_emoji_heavy_split_does_not_drop_characters():
+    # Newlines fall inside the budget, but the astral width pushes the part
+    # over it, so the cut backs off the separator; nothing may be lost.
+    line = "😀" * 400 + "\n"
+    content = line * 6
+
+    parts = bot_module._split_message(content)
+
+    assert all(bot_module._discord_len(p) <= 2000 for p in parts)
+    assert "".join(parts).replace("\n", "") == content.replace("\n", "")
+
+
+def test_pending_retry_remembers_continuation_ids(monkeypatch):
+    saved = []
+    monkeypatch.setattr(bot_module, "_pending_retries", {})
+    monkeypatch.setattr(bot_module, "_persist_pending_retries", AsyncMock())
+    monkeypatch.setattr(bot_module, "_spawn", lambda coro: coro.close())
+
+    run(bot_module._schedule_retry("txt", "auto", "ru", 7, 202, 20, extra_ids=(21, 22)))
+
+    assert bot_module._pending_retries["202:20"]["extra_ids"] == [21, 22]
+
+
+def test_restored_retry_edits_the_continuation_messages_too(monkeypatch):
+    seen = {}
+
+    async def fake_retry_translate(text, src, dest, url, msg_id, ch_id, cluster, glossary=None, delay=60):
+        seen["extra_parts"] = cluster.get("extra_parts")
+
+    monkeypatch.setattr(bot_module, "_msg_clusters", {})
+    monkeypatch.setattr(bot_module, "_pending_retries", {"202:20": {
+        "text": "t", "src": "auto", "dest": "ru", "guild_id": 7, "ch_id": 202, "msg_id": 20,
+        "due": 0, "prefix": "", "extra_ids": [21, 22]}})
+    monkeypatch.setattr(bot_module, "_persist_pending_retries", AsyncMock())
+    monkeypatch.setattr(bot_module, "_retry_translate", fake_retry_translate)
+    monkeypatch.setattr(bot_module, "channel_configs", {7: {202: {"webhook_url": "hook"}}})
+    monkeypatch.setattr(bot_module, "get_guild_glossary", lambda *a: {})
+
+    run(bot_module._run_retry("202:20"))
+
+    assert seen["extra_parts"] == {202: [21, 22]}
+
+
+def test_pending_retry_file_accepts_extra_ids_and_rejects_bad_ones(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setattr(glossary, "PENDING_RETRIES_FILE", str(tmp_path / "p.json"))
+    base = {"text": "t", "src": "a", "dest": "b", "guild_id": 1, "ch_id": 2, "msg_id": 3, "due": 1.0}
+    (tmp_path / "p.json").write_text(json.dumps([
+        {**base, "extra_ids": [4, 5]},
+        {**base, "msg_id": 6, "extra_ids": ["x"]},
+        {**base, "msg_id": 7},            # entries written before this feature
+    ]))
+
+    kept = [e["msg_id"] for e in glossary.load_pending_retries()]
+
+    assert kept == [3, 7]

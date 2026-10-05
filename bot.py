@@ -153,6 +153,7 @@ def _split_message(content: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str
             cut, skip = budget, 0
         while cut > len(reopen) + 1 and _discord_len(text[:cut]) > budget:
             cut -= 1
+            skip = 0  # no longer on a separator: don't drop a real character
         head, rest = text[:cut], text[cut + skip:]
         if head.count(_FENCE) % 2:
             head += "\n" + _FENCE
@@ -798,6 +799,7 @@ async def on_message(message: discord.Message):
                     normalize_lang(guild_channels[ch_id]["lang"]),
                     message.guild.id, ch_id, sent_id,
                     prefix=cluster.get("prefixes", {}).get(ch_id, ""),
+                    extra_ids=cluster.get("extra_parts", {}).get(ch_id, ()),
                 )
 
 
@@ -919,7 +921,14 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         for (ch_id, old_msg_id, _, _), result in zip(edit_targets, send_results):
             for old_id in [old_msg_id, *old_extras[ch_id]]:
                 _msg_clusters.pop(old_id, None)
-            if result is not None:
+            if result is None:
+                # The old continuation messages were deleted above; don't keep
+                # their ids around to 404 on later edits/deletes.
+                extra_parts = cluster.get("extra_parts", {})
+                extra_parts.pop(ch_id, None)
+                if not extra_parts:
+                    cluster.pop("extra_parts", None)
+            else:
                 cluster["contents"][ch_id] = _record_forward(cluster, ch_id, result)
                 cluster["att_names"][ch_id] = curr_att_names
                 for _, new_id in _cluster_messages({
@@ -1261,6 +1270,7 @@ async def _persist_pending_retries() -> None:
 async def _schedule_retry(
     text: str, src: str, dest: str, guild_id: int, ch_id: int, msg_id: int,
     delay: float = RETRY_DELAY_SECONDS, prefix: str = "",
+    extra_ids: tuple[int, ...] | list[int] = (),
 ) -> None:
     key = _retry_key(ch_id, msg_id)
     if key in _pending_retries:
@@ -1273,7 +1283,7 @@ async def _schedule_retry(
     entry = {
         "text": text, "src": src, "dest": dest, "guild_id": guild_id,
         "ch_id": ch_id, "msg_id": msg_id, "due": time.time() + delay,
-        "prefix": prefix,
+        "prefix": prefix, "extra_ids": list(extra_ids),
     }
     _pending_retries[key] = entry
     await _persist_pending_retries()
@@ -1299,6 +1309,10 @@ async def _run_retry(key: str) -> None:
             # restart whose cluster was never persisted. The stored prefix is
             # enough to edit the message; there is no cluster to update.
             cluster = {"prefixes": {entry["ch_id"]: entry.get("prefix", "")}, "contents": {}}
+            if entry.get("extra_ids"):
+                # Continuation messages of a split post, so the edit updates
+                # them instead of leaving the old text behind as orphans.
+                cluster["extra_parts"] = {entry["ch_id"]: list(entry["extra_ids"])}
         await _retry_translate(
             entry["text"], entry["src"], entry["dest"], info["webhook_url"],
             entry["msg_id"], entry["ch_id"], cluster,

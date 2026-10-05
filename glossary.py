@@ -261,4 +261,6 @@ def load_pending_retries() -> list[dict]:
         if isinstance(entry, dict)
         and all(isinstance(entry.get(k), t) for k, t in required.items())
         and isinstance(entry.get("prefix", ""), str)
+        and isinstance(entry.get("extra_ids", []), list)
+        and all(isinstance(i, int) for i in entry.get("extra_ids", []))
     ]
