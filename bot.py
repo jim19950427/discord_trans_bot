@@ -32,6 +32,7 @@ from glossary import (
     save_clusters, load_clusters,
     save_thread_clusters, load_thread_clusters,
     save_channel_pins, load_channel_pins,
+    save_pending_retries, load_pending_retries,
 )
 
 load_dotenv()
@@ -48,6 +49,7 @@ cleanup_stale_tmp([
     _glossary_module.GLOSSARY_FILE, _glossary_module.SUBSTITUTIONS_FILE,
     _glossary_module.USER_LANGS_FILE, _glossary_module.CLUSTERS_FILE,
     _glossary_module.THREAD_CLUSTERS_FILE, _glossary_module.CHANNEL_PINS_FILE,
+    _glossary_module.PENDING_RETRIES_FILE,
 ])
 
 # ── Hot-reload file watcher ────────────────────────────────────────────────
@@ -129,6 +131,33 @@ _channel_pins: dict[int, set[int]] = {}
 # thread_id -> {parent_ch_id: thread_id, ...} mapping across all language channels
 _thread_clusters: dict[int, dict[int, int]] = {}
 
+# Set once on_ready has finished its first full initialisation.
+_startup_done = False
+
+# asyncio only keeps a weak reference to running tasks, so a fire-and-forget
+# create_task() can be garbage-collected mid-sleep. Hold strong references.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _on_background_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        log_event(f"[background] task failed: {task.exception()!r}", type="error")
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_on_background_done)
+    return task
+
+
+# Delayed translation retries not yet run, keyed "channel_id:message_id".
+# Persisted on every change so a restart/deploy inside the 60s window keeps them.
+RETRY_DELAY_SECONDS = 60
+_RETRY_MAX_AGE_SECONDS = 3600
+_pending_retries: dict[str, dict] = {}
+
 
 def _store_cluster(cluster: dict) -> None:
     for msg_id in cluster["channels"].values():
@@ -209,12 +238,78 @@ async def on_close():
 
 
 # ---------------------------------------------------------------------------
+# Liveness: heartbeat file + watchdog
+# ---------------------------------------------------------------------------
+# `restart: unless-stopped` only helps when the process exits. A hung event
+# loop or a gateway connection that never comes back leaves a "running" but
+# dead container, so the bot restarts itself. The heartbeat file's mtime also
+# feeds the compose healthcheck (visible in Container Manager).
+
+HEARTBEAT_FILE = os.environ.get("HEARTBEAT_FILE", "/data/heartbeat")
+WATCHDOG_LOOP_STALL_SECONDS = 300
+WATCHDOG_NOT_READY_SECONDS = 900
+_last_loop_beat = time.monotonic()
+
+
+def _touch_heartbeat(path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a"):
+        os.utime(path, None)
+
+
+@tasks.loop(seconds=30)
+async def _heartbeat():
+    global _last_loop_beat
+    _last_loop_beat = time.monotonic()
+    if bot.is_ready():
+        try:
+            await asyncio.to_thread(_touch_heartbeat, HEARTBEAT_FILE)
+        except OSError as e:
+            print(f"[heartbeat write failed] {e}")
+
+
+def _watchdog_verdict(
+    now: float, last_beat: float, not_ready_since: float | None,
+    *, loop_stall: float = WATCHDOG_LOOP_STALL_SECONDS,
+    not_ready_limit: float = WATCHDOG_NOT_READY_SECONDS,
+) -> str | None:
+    """Reason to restart the process, or None if it looks healthy."""
+    if now - last_beat > loop_stall:
+        return f"event loop silent for over {int(loop_stall)}s"
+    if not_ready_since is not None and now - not_ready_since > not_ready_limit:
+        return f"gateway not ready for over {int(not_ready_limit)}s"
+    return None
+
+
+def _watchdog():
+    not_ready_since: float | None = None
+    while True:
+        time.sleep(30)
+        now = time.monotonic()
+        if bot.is_ready():
+            not_ready_since = None
+        elif not_ready_since is None:
+            not_ready_since = now
+        reason = _watchdog_verdict(now, _last_loop_beat, not_ready_since)
+        if reason:
+            log_event(f"[watchdog] {reason} — restarting")
+            os._exit(1)
+
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
 @bot.event
 async def on_ready():
     global channel_configs, _glossary_data, _substitutions_data, _user_langs_data
+    global _startup_done
+    if _startup_done:
+        # on_ready fires again after a gateway reconnect. Re-running the
+        # restore below would overwrite live in-memory clusters (and break
+        # their shared identity) with the last on-disk snapshot.
+        log_event("Gateway reconnected (on_ready fired again) — state kept")
+        return
     channel_configs = load_channel_config()
     _glossary_data = load_glossary()
     _substitutions_data = load_substitutions()
@@ -239,6 +334,10 @@ async def on_ready():
 
     if not _persist_clusters.is_running():
         _persist_clusters.start()
+    await _restore_pending_retries()
+    if not _heartbeat.is_running():
+        _heartbeat.start()
+    threading.Thread(target=_watchdog, daemon=True).start()
 
     log_event(f"Logged in as {bot.user} (ID: {bot.user.id})")
     log_event(f"Loaded channel configs for {len(channel_configs)} guild(s)")
@@ -255,6 +354,7 @@ async def on_ready():
         atomic_write_json(_status_file, {"last_start": time.strftime("%Y-%m-%d %H:%M:%S")})
     except Exception as _e:
         print(f"[status write failed] {_e}")
+    _startup_done = True
 
 
 # ---------------------------------------------------------------------------
@@ -443,13 +543,11 @@ async def on_message(message: discord.Message):
                 sent_text.strip() != content.strip(),
             )
             if not translation_succeeded:
-                asyncio.create_task(
-                    _retry_translate(
-                        content, source_lang,
-                        normalize_lang(guild_channels[ch_id]["lang"]),
-                        guild_channels[ch_id]["webhook_url"],
-                        sent_id, ch_id, cluster, guild_glossary,
-                    )
+                await _schedule_retry(
+                    content, source_lang,
+                    normalize_lang(guild_channels[ch_id]["lang"]),
+                    message.guild.id, ch_id, sent_id,
+                    prefix=cluster.get("prefixes", {}).get(ch_id, ""),
                 )
 
 
@@ -886,6 +984,161 @@ async def _retry_translate(
         log_event(f"[retry] edit failed msg={msg_id} ch={ch_id}: {e}")
 
 
+def _retry_key(ch_id: int, msg_id: int) -> str:
+    return f"{ch_id}:{msg_id}"
+
+
+_pending_persist_lock = asyncio.Lock()
+
+
+async def _persist_pending_retries() -> None:
+    # Snapshot inside the lock so concurrent callers can't write an older
+    # snapshot after a newer one.
+    async with _pending_persist_lock:
+        await asyncio.to_thread(save_pending_retries, list(_pending_retries.values()))
+
+
+async def _schedule_retry(
+    text: str, src: str, dest: str, guild_id: int, ch_id: int, msg_id: int,
+    delay: float = RETRY_DELAY_SECONDS, prefix: str = "",
+) -> None:
+    key = _retry_key(ch_id, msg_id)
+    if key in _pending_retries:
+        # One live task per message: a second would let whichever finishes
+        # first delete the other's persisted entry.
+        return
+    # `prefix` (the reply-quote header) is stored so the edit can be rebuilt
+    # after a restart even though clusters are only saved every 60s and the
+    # cluster for this message may not be on disk yet.
+    entry = {
+        "text": text, "src": src, "dest": dest, "guild_id": guild_id,
+        "ch_id": ch_id, "msg_id": msg_id, "due": time.time() + delay,
+        "prefix": prefix,
+    }
+    _pending_retries[key] = entry
+    await _persist_pending_retries()
+    _spawn(_run_retry(key))
+
+
+async def _run_retry(key: str) -> None:
+    entry = _pending_retries.get(key)
+    if entry is None:
+        return
+    try:
+        await asyncio.sleep(max(0.0, entry["due"] - time.time()))
+        info = channel_configs.get(entry["guild_id"], {}).get(entry["ch_id"])
+        if not info or not info.get("webhook_url"):
+            log_event(
+                f"[retry] dropped: channel no longer configured "
+                f"(ch={entry['ch_id']} msg={entry['msg_id']})"
+            )
+            return
+        cluster = _msg_clusters.get(entry["msg_id"])
+        if cluster is None:
+            # Not tracked in memory — typically a retry restored after a
+            # restart whose cluster was never persisted. The stored prefix is
+            # enough to edit the message; there is no cluster to update.
+            cluster = {"prefixes": {entry["ch_id"]: entry.get("prefix", "")}, "contents": {}}
+        await _retry_translate(
+            entry["text"], entry["src"], entry["dest"], info["webhook_url"],
+            entry["msg_id"], entry["ch_id"], cluster,
+            get_guild_glossary(entry["guild_id"], _glossary_data), delay=0,
+        )
+    finally:
+        _pending_retries.pop(key, None)
+        await _persist_pending_retries()
+
+
+async def _restore_pending_retries() -> None:
+    """Re-arm retries that were still waiting when the process last stopped."""
+    now = time.time()
+    restored = 0
+    for entry in load_pending_retries():
+        key = _retry_key(entry["ch_id"], entry["msg_id"])
+        if key in _pending_retries or now - entry["due"] > _RETRY_MAX_AGE_SECONDS:
+            continue
+        _pending_retries[key] = entry
+        _spawn(_run_retry(key))
+        restored += 1
+    if restored:
+        log_event(f"[retry] restored {restored} pending retr{'y' if restored == 1 else 'ies'}")
+
+
+_UNKNOWN_WEBHOOK = 10015   # Discord JSON error code: Unknown Webhook
+_heal_lock = asyncio.Lock()
+# old webhook url -> recreated url, so callers still holding a stale snapshot
+# of channel_configs (e.g. a fan-out already in flight) reach the new webhook.
+_healed_urls: dict[str, str] = {}
+
+
+def _find_channel_by_webhook(webhook_url: str):
+    for guild_id, chans in channel_configs.items():
+        for ch_id, info in chans.items():
+            if info.get("webhook_url") == webhook_url:
+                return guild_id, ch_id, info
+    return None
+
+
+async def _heal_webhook(old_url: str) -> str | None:
+    """Recreate a webhook that was deleted in Discord and store the new URL.
+    Returns the new URL, or None if it can't be recovered. Never logs URLs."""
+    async with _heal_lock:
+        if old_url in _healed_urls:
+            return _healed_urls[old_url]
+        found = _find_channel_by_webhook(old_url)
+        if found is None:
+            return None
+        _, ch_id, info = found
+        channel = bot.get_channel(ch_id)
+        if not isinstance(channel, discord.TextChannel):
+            return None
+        try:
+            hook = next(
+                (w for w in await channel.webhooks() if w.name == WEBHOOK_NAME), None
+            )
+            if hook is None:
+                hook = await channel.create_webhook(name=WEBHOOK_NAME)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log_event(
+                f"[webhook] could not recreate webhook for channel {ch_id}: {e}",
+                type="error",
+            )
+            return None
+        info["webhook_url"] = hook.url
+        await asyncio.to_thread(save_channel_config, channel_configs)
+        _healed_urls[old_url] = hook.url
+        log_event(f"[webhook] recreated missing webhook for channel {ch_id}")
+        return hook.url
+
+
+async def _webhook_send(webhook_url: str, base_kwargs: dict, file_data: list):
+    """webhook.send with one self-heal attempt if the webhook no longer exists.
+    discord.File objects are single-use, so they are rebuilt for each attempt."""
+    def build() -> dict:
+        kwargs = dict(base_kwargs)
+        if file_data:
+            kwargs["files"] = [
+                discord.File(io.BytesIO(data), filename=name) for name, data in file_data
+            ]
+        return kwargs
+
+    async def post(url: str):
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(url, session=session)
+            return await webhook.send(**build())
+
+    webhook_url = _healed_urls.get(webhook_url, webhook_url)
+    try:
+        return await post(webhook_url)
+    except discord.NotFound as e:
+        if e.code != _UNKNOWN_WEBHOOK:
+            raise
+        new_url = await _heal_webhook(webhook_url)
+        if new_url is None or new_url == webhook_url:
+            raise
+        return await post(new_url)
+
+
 async def _raw_forward_send(
     text: str,
     webhook_url: str,
@@ -898,7 +1151,7 @@ async def _raw_forward_send(
     thread_id: int | None = None,
     msg_link: str | None = None,
 ) -> _ForwardResult | None:
-    files: list[discord.File] = []
+    file_data: list[tuple[str, bytes]] = []
     urls: list[tuple[str, str]] = (
         [(att.url, att.filename) for att in attachments]
         + [(s.url, f"{s.name}.{'gif' if s.format == discord.StickerFormatType.gif else 'png'}") for s in stickers]
@@ -909,11 +1162,11 @@ async def _raw_forward_send(
                 async with dl.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.read()
-                        files.append(discord.File(io.BytesIO(data), filename=filename))
+                        file_data.append((filename, data))
         except Exception as e:
             log_event(f"Download failed ({filename}): {e}")
 
-    if not text and not files:
+    if not text and not file_data:
         return None
 
     parts: list[str] = []
@@ -932,19 +1185,15 @@ async def _raw_forward_send(
     send_kwargs: dict = {"username": username, "avatar_url": avatar_url, "wait": True}
     if final_content:
         send_kwargs["content"] = final_content
-    if files:
-        send_kwargs["files"] = files
     if thread_id:
         send_kwargs["thread"] = discord.Object(id=thread_id)
 
     try:
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(webhook_url, session=session)
-            msg = await webhook.send(**send_kwargs)
-            return msg.id, text or ""
+        msg = await _webhook_send(webhook_url, send_kwargs, file_data)
+        return msg.id, text or ""
     except Exception as e:
         # Never log webhook_url — it embeds the webhook's auth token.
-        log_event(f"[forward] send failed (author={username!r}, files={len(files)}): {e}")
+        log_event(f"[forward] send failed (author={username!r}, files={len(file_data)}): {e}")
         return None
 
 
@@ -963,7 +1212,7 @@ async def _send_pretranslated(
 ) -> _ForwardResult | None:
     translated = outcome.text
 
-    files: list[discord.File] = []
+    file_data: list[tuple[str, bytes]] = []
     urls: list[tuple[str, str]] = (
         [(att.url, att.filename) for att in attachments]
         + [(s.url, f"{s.name}.{'gif' if s.format == discord.StickerFormatType.gif else 'png'}") for s in stickers]
@@ -974,11 +1223,11 @@ async def _send_pretranslated(
                 async with dl.get(url) as resp:
                     if resp.status == 200:
                         data = await resp.read()
-                        files.append(discord.File(io.BytesIO(data), filename=filename))
+                        file_data.append((filename, data))
         except Exception as e:
             log_event(f"Download failed ({filename}): {e}")
 
-    if not translated and not files:
+    if not translated and not file_data:
         return None
 
     parts: list[str] = []
@@ -997,23 +1246,19 @@ async def _send_pretranslated(
     send_kwargs: dict = {"username": username, "avatar_url": avatar_url, "wait": True}
     if final_content:
         send_kwargs["content"] = final_content
-    if files:
-        send_kwargs["files"] = files
     if thread_id:
         send_kwargs["thread"] = discord.Object(id=thread_id)
 
     try:
-        async with aiohttp.ClientSession() as session:
-            webhook = discord.Webhook.from_url(webhook_url, session=session)
-            msg = await webhook.send(**send_kwargs)
-            return _ForwardResult(
-                msg.id,
-                translated or "",
-                outcome.provider_succeeded,
-            )
+        msg = await _webhook_send(webhook_url, send_kwargs, file_data)
+        return _ForwardResult(
+            msg.id,
+            translated or "",
+            outcome.provider_succeeded,
+        )
     except Exception as e:
         # Never log webhook_url — it embeds the webhook's auth token.
-        log_event(f"[forward] send failed (author={username!r}, dest={dest}, files={len(files)}): {e}")
+        log_event(f"[forward] send failed (author={username!r}, dest={dest}, files={len(file_data)}): {e}")
         return None
 
 
@@ -1877,19 +2122,69 @@ async def translate_context_menu(interaction: discord.Interaction, message: disc
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# Slash command error handlers
-@slash_translation_status.error
-@slash_addlang.error
-@slash_removelang.error
-@slash_addterm.error
-@slash_removeterm.error
-@slash_addproper.error
-@slash_removeproper.error
-@slash_addsub.error
-@slash_removesub.error
-async def _perm_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("需要「管理頻道」權限。", ephemeral=True)
+# Command error handling.
+# Commands that have their own `.error` handler make discord.py's default
+# CommandTree.on_error return silently, so any error other than the one the
+# handler checks for used to vanish without a reply or a log line. All errors
+# are now handled here instead.
+_MISSING_PERMISSIONS_TEXT = "需要「管理頻道」權限。"
+
+
+def _command_error_text(error: Exception) -> str:
+    """User-facing reply for a command failure (never includes internals)."""
+    error = getattr(error, "original", error)
+    if isinstance(error, (app_commands.MissingPermissions, commands.MissingPermissions)):
+        return _MISSING_PERMISSIONS_TEXT
+    if isinstance(error, discord.Forbidden):
+        return "機器人缺少所需權限（例如「管理 Webhook」或在該頻道發言），請調整權限後再試。"
+    if isinstance(error, discord.HTTPException):
+        return f"Discord 回應錯誤（HTTP {error.status}），請稍後再試。"
+    if isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
+        return "指令參數有誤，請確認用法。"
+    return "發生未預期的錯誤，已記錄，請稍後再試。"
+
+
+def _log_command_error(name: str | None, error: Exception, guild_id, channel_id) -> None:
+    original = getattr(error, "original", error)
+    log_event(
+        f"[command] {name or '?'} failed: {type(original).__name__}: {original}",
+        type="error", command=name, guild_id=guild_id, channel_id=channel_id,
+    )
+
+
+@bot.tree.error
+async def _on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if not isinstance(error, (app_commands.MissingPermissions, app_commands.CheckFailure)):
+        _log_command_error(
+            interaction.command.name if interaction.command else None,
+            error, interaction.guild_id, interaction.channel_id,
+        )
+    text = _command_error_text(error)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    # "!" is a common prefix shared with other bots: stay quiet on unknown commands.
+    if isinstance(error, (commands.CommandNotFound, commands.CheckFailure)) and not isinstance(
+        error, commands.MissingPermissions
+    ):
+        return
+    if not isinstance(error, (commands.MissingPermissions, commands.UserInputError)):
+        _log_command_error(
+            ctx.command.name if ctx.command else None, error,
+            ctx.guild.id if ctx.guild else None, ctx.channel.id,
+        )
+    try:
+        await ctx.send(_command_error_text(error))
+    except discord.HTTPException:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1897,10 +2192,17 @@ async def _perm_error(interaction: discord.Interaction, error: app_commands.AppC
 # ---------------------------------------------------------------------------
 
 async def _do_setlang(guild_id: int, target: discord.TextChannel, lang_code: str, respond, group: str = "default") -> None:
-    webhooks = await target.webhooks()
-    webhook = next((w for w in webhooks if w.name == WEBHOOK_NAME), None)
-    if webhook is None:
-        webhook = await target.create_webhook(name=WEBHOOK_NAME)
+    try:
+        webhooks = await target.webhooks()
+        webhook = next((w for w in webhooks if w.name == WEBHOOK_NAME), None)
+        if webhook is None:
+            webhook = await target.create_webhook(name=WEBHOOK_NAME)
+    except discord.Forbidden:
+        await respond(
+            f"機器人在 {target.mention} 缺少「管理 Webhook」權限，無法建立轉發用的 Webhook。"
+            "請授權後再執行一次。"
+        )
+        return
 
     if guild_id not in channel_configs:
         channel_configs[guild_id] = {}

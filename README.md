@@ -201,9 +201,13 @@ Azure 的安全提供者事件包含 `target_count`（該批去重後的目標�
 |------|------|
 | 不翻譯前綴 `//` | 訊息以 `//` 開頭時，不翻譯、不轉發，只在來源頻道顯示。例如輸入 `// 這段不要翻譯` |
 | 原文轉發前綴 `\` | 訊息以 `\` 開頭時，不翻譯、但原文轉發到所有語言頻道。例如輸入 `\ GG`，所有頻道都會顯示 `GG` |
-| 純 Emoji 訊息 | 只有 Emoji 的訊息（如 👀）直接原文轉發，不嘗試翻譯（避免 Google 亂翻） |
+| 純 Emoji 訊息 | 只有 Emoji 的訊息（如 👀）直接原文轉發，不嘗試翻譯（避免翻譯服務對單純表情亂翻） |
 | Discord 自訂表情 | `<:name:id>` 格式的自訂表情從翻譯中抽出，接在翻譯結果後方 |
 | 🔄 翻譯回報 | 對翻譯結果不滿意時，在任一語言頻道的翻譯訊息上按 🔄 Reaction，Bot 會重新翻譯並更新該訊息（🔄 自動消失，可再次使用） |
+| 重試不怕重啟 | 翻譯失敗後 60 秒的重試會寫入 `pending_retries.json`；在等待期間重啟或部署，重啟後會自動補跑（超過 1 小時的會捨棄） |
+| Webhook 自動重建 | 若轉發用的 Webhook 被人在 Discord 刪掉，下次轉發時 Bot 會自動重建並更新設定，不需重新執行 `/addlang`（需要「管理 Webhook」權限） |
+| 指令錯誤回報 | 指令失敗時會以僅自己可見的訊息說明原因（例如缺少權限），完整錯誤記錄在 `bot_log.jsonl`（`type: "error"`） |
+| 自動重啟看門狗 | Bot 每 30 秒更新 `/data/heartbeat`；事件迴圈卡住 5 分鐘、或與 Discord 斷線超過 15 分鐘，Bot 會自行結束並由 Docker 重啟。compose 的 healthcheck 也會用同一個檔案顯示健康狀態 |
 | 右鍵 → **翻譯此訊息** | 依個人設定的翻譯語言（`/addmylang`）顯示翻譯結果（僅自己可見，不轉發） |
 | 右鍵 → **查看原文** | 顯示任一語言頻道翻譯訊息的原始文字、來源頻道與發送者（僅自己可見） |
 | 右鍵 → **重新翻譯** | 對指定翻譯訊息強制重新翻譯並更新內容，等同 🔄 但更直覺（僅自己可見回應） |
@@ -244,4 +248,4 @@ Azure 的安全提供者事件包含 `target_count`（該批去重後的目標�
 | `ar` | العربية | 阿拉伯文 |
 | `pl` | Polski | 波蘭文 |
 
-完整語言代碼清單請參考：https://py-googletrans.readthedocs.io/en/latest/
+完整語言代碼清單請參考 [Azure Translator 支援語言](https://learn.microsoft.com/azure/ai-services/translator/language-support)。NAS 備援（LibreTranslate）只載入 `docker-compose.yml` 中 `LT_LOAD_ONLY` 列出的語言，不在清單內的語言在 Azure 無法使用時不會有備援。
