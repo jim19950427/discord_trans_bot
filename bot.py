@@ -818,11 +818,16 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         return
     guild_channels = _group_channels(all_gc, source_ch_id)
 
-    # Updates to bot/webhook messages (our own mirrors get one when Discord
-    # unfurls a link, usually before their cluster is stored) never need
-    # syncing; skip them before the lookup so they don't log as ignored edits.
+    # Updates to our own mirrors (Discord sends one when it unfurls a link,
+    # usually before their cluster is stored) never need syncing. Unfurl updates
+    # are partial payloads that may lack webhook_id/author, so recognise the
+    # message by id (recorded when we sent it) and fall back to the payload.
     data = getattr(payload, "data", None) or {}
-    if data.get("webhook_id") or (data.get("author") or {}).get("bot"):
+    if (
+        _is_recent_own_message(payload.message_id)
+        or data.get("webhook_id")
+        or (data.get("author") or {}).get("bot")
+    ):
         return
 
     cluster = _msg_clusters.get(payload.message_id)
@@ -1392,6 +1397,25 @@ async def _heal_webhook(old_url: str) -> str | None:
         return hook.url
 
 
+# Ids of messages we just posted through a webhook, so the MESSAGE_UPDATE that
+# follows a link unfurl is recognised as ours instead of logged as an ignored edit.
+_OWN_MESSAGE_TTL_SECONDS = 120.0
+_own_message_ids: dict[int, float] = {}
+
+
+def _note_own_message(message):
+    now = time.monotonic()
+    for old_id in [i for i, t in _own_message_ids.items() if now - t > _OWN_MESSAGE_TTL_SECONDS]:
+        del _own_message_ids[old_id]
+    _own_message_ids[message.id] = now
+    return message
+
+
+def _is_recent_own_message(message_id: int) -> bool:
+    seen = _own_message_ids.get(message_id)
+    return seen is not None and time.monotonic() - seen <= _OWN_MESSAGE_TTL_SECONDS
+
+
 async def _webhook_send(webhook_url: str, base_kwargs: dict, file_data: list):
     """webhook.send with one self-heal attempt if the webhook no longer exists.
     discord.File objects are single-use, so they are rebuilt for each attempt."""
@@ -1409,14 +1433,14 @@ async def _webhook_send(webhook_url: str, base_kwargs: dict, file_data: list):
 
     webhook_url = _healed_urls.get(webhook_url, webhook_url)
     try:
-        return await post(webhook_url)
+        return _note_own_message(await post(webhook_url))
     except discord.NotFound as e:
         if e.code != _UNKNOWN_WEBHOOK:
             raise
         new_url = await _heal_webhook(webhook_url)
         if new_url is None or new_url == webhook_url:
             raise
-        return await post(new_url)
+        return _note_own_message(await post(new_url))
 
 
 async def _send_with_parts(webhook_url: str, send_kwargs: dict, file_data: list):
