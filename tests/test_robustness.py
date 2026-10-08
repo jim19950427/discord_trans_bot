@@ -444,3 +444,33 @@ def test_concurrent_retry_scheduling_persists_every_entry(retry_env, monkeypatch
 
     saved = run(scenario())
     assert sorted(e["msg_id"] for e in saved) == list(range(10, 20))
+
+
+@pytest.mark.parametrize("data", [{"webhook_id": "123"}, {"author": {"bot": True}}])
+def test_updates_to_webhook_or_bot_messages_are_skipped_silently(monkeypatch, data):
+    """Our own mirrors get an update when Discord unfurls a link; not an ignored edit."""
+    logged = []
+    channel = SimpleNamespace(id=101, guild=SimpleNamespace(id=7), fetch_message=AsyncMock())
+    monkeypatch.setattr(bot_module.bot, "get_channel", lambda _id: channel)
+    monkeypatch.setattr(bot_module, "channel_configs", {7: {101: {"lang": "en", "group": "default"}}})
+    monkeypatch.setattr(bot_module, "_msg_clusters", {})
+    monkeypatch.setattr(bot_module, "log_event", lambda msg, **kw: logged.append(msg))
+
+    run(bot_module.on_raw_message_edit(SimpleNamespace(channel_id=101, message_id=5, data=data)))
+
+    assert logged == []
+    channel.fetch_message.assert_not_awaited()
+
+
+def test_untracked_user_message_edit_is_still_logged(monkeypatch):
+    logged = []
+    channel = SimpleNamespace(id=101, guild=SimpleNamespace(id=7), fetch_message=AsyncMock())
+    monkeypatch.setattr(bot_module.bot, "get_channel", lambda _id: channel)
+    monkeypatch.setattr(bot_module, "channel_configs", {7: {101: {"lang": "en", "group": "default"}}})
+    monkeypatch.setattr(bot_module, "_msg_clusters", {})
+    monkeypatch.setattr(bot_module, "log_event", lambda msg, **kw: logged.append(msg))
+
+    run(bot_module.on_raw_message_edit(SimpleNamespace(
+        channel_id=101, message_id=5, data={"author": {"bot": False}})))
+
+    assert len(logged) == 1 and logged[0].startswith("Edit ignored")

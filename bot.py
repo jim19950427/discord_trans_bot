@@ -818,6 +818,13 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         return
     guild_channels = _group_channels(all_gc, source_ch_id)
 
+    # Updates to bot/webhook messages (our own mirrors get one when Discord
+    # unfurls a link, usually before their cluster is stored) never need
+    # syncing; skip them before the lookup so they don't log as ignored edits.
+    data = getattr(payload, "data", None) or {}
+    if data.get("webhook_id") or (data.get("author") or {}).get("bot"):
+        return
+
     cluster = _msg_clusters.get(payload.message_id)
     if not cluster:
         log_event(
