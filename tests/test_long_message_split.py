@@ -208,7 +208,7 @@ def edit_env(monkeypatch):
     sender = _FakeSender()
     monkeypatch.setattr(bot_module, "_webhook_send", sender)
 
-    async def fake_delete(url, msg_id, ch_id):
+    async def fake_delete(url, msg_id, ch_id, thread_id=None):
         deletes.append(msg_id)
 
     monkeypatch.setattr(bot_module, "_delete_webhook_message", fake_delete)
@@ -282,7 +282,7 @@ def test_deleting_a_message_removes_every_continuation_part(monkeypatch):
     monkeypatch.setattr(bot_module, "_guild_channels_for",
                         lambda ch: {202: {"webhook_url": "hook"}})
 
-    async def fake_delete(url, msg_id, ch_id):
+    async def fake_delete(url, msg_id, ch_id, thread_id=None):
         deleted.append(msg_id)
 
     monkeypatch.setattr(bot_module, "_delete_webhook_message", fake_delete)

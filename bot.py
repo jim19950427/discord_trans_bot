@@ -164,6 +164,17 @@ def _split_message(content: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str
     return chunks
 
 
+def _thread_of(cluster: dict, ch_id: int) -> int | None:
+    """Thread a channel's copy lives in, if the cluster was posted in threads."""
+    return cluster.get("thread_channels", {}).get(ch_id)
+
+
+def _thread_kwargs(thread_id: int | None) -> dict:
+    # Webhook edits/deletes of a message inside a thread must name the thread,
+    # otherwise Discord looks for it in the parent channel and returns 404.
+    return {"thread": discord.Object(id=thread_id)} if thread_id else {}
+
+
 def _cluster_messages(cluster: dict) -> list[tuple[int, int]]:
     """Every (channel_id, message_id) of a cluster, including the continuation
     messages of split long posts."""
@@ -614,11 +625,37 @@ async def _announce_watchdog_restart() -> None:
 # Message events
 # ---------------------------------------------------------------------------
 
+# message id -> Event set once on_message has finished forwarding it (cluster
+# stored). An edit or delete that lands while the forward is still translating
+# or sending would otherwise find no cluster and be dropped for good.
+_inflight_forwards: dict[int, asyncio.Event] = {}
+_INFLIGHT_WAIT_SECONDS = 60.0
+
+
+async def _wait_for_forward(message_id: int) -> None:
+    done = _inflight_forwards.get(message_id)
+    if done is None:
+        return
+    try:
+        await asyncio.wait_for(done.wait(), _INFLIGHT_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        log_event(f"[forward] gave up waiting for message {message_id} to finish forwarding")
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+    done = asyncio.Event()
+    _inflight_forwards[message.id] = done
+    try:
+        await _forward_message(message)
+    finally:
+        _inflight_forwards.pop(message.id, None)
+        done.set()
 
+
+async def _forward_message(message: discord.Message) -> None:
     await bot.process_commands(message)
 
     all_gc = channel_configs.get(message.guild.id, {})
@@ -830,6 +867,8 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
     ):
         return
 
+    if payload.message_id not in _msg_clusters:
+        await _wait_for_forward(payload.message_id)
     cluster = _msg_clusters.get(payload.message_id)
     if not cluster:
         log_event(
@@ -876,7 +915,9 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
         for ch_id, msg_id, _, wh_url in edit_targets:
             try:
                 webhook = discord.Webhook.from_url(wh_url, session=_get_http_session())
-                await webhook.edit_message(msg_id, embeds=current_embeds)
+                await webhook.edit_message(
+                    msg_id, embeds=current_embeds, **_thread_kwargs(_thread_of(cluster, ch_id))
+                )
             except Exception as e:
                 log_event(f"Failed to forward embeds to channel {ch_id}: {e}")
 
@@ -894,7 +935,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
             for ch_id, *_ in edit_targets
         }
         await asyncio.gather(*[
-            _delete_webhook_message(wh_url, mid, ch_id)
+            _delete_webhook_message(wh_url, mid, ch_id, _thread_of(cluster, ch_id))
             for ch_id, msg_id, _, wh_url in edit_targets
             for mid in [msg_id, *old_extras[ch_id]]
         ])
@@ -915,6 +956,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                     new_content, wh_url, cluster["author"], cluster["avatar_url"],
                     current_attachments, current_stickers,
                     cluster.get("prefixes", {}).get(ch_id), None,
+                    thread_id=_thread_of(cluster, ch_id),
                 )
                 if raw_forward else
                 _send_pretranslated(
@@ -922,6 +964,7 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
                     wh_url, cluster["author"], cluster["avatar_url"],
                     current_attachments, current_stickers,
                     cluster.get("prefixes", {}).get(ch_id), None,
+                    thread_id=_thread_of(cluster, ch_id),
                 )
             )
             for ch_id, _, lang, wh_url in edit_targets
@@ -978,6 +1021,10 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 
 @bot.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
+    if payload.message_id not in _msg_clusters:
+        # Deleted while still being forwarded: wait, so the mirrors it is
+        # about to create get deleted too instead of being left behind.
+        await _wait_for_forward(payload.message_id)
     cluster = _msg_clusters.pop(payload.message_id, None)
     if not cluster:
         return
@@ -995,7 +1042,9 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent):
     guild_channels = _guild_channels_for(payload.channel_id)
 
     await asyncio.gather(*[
-        _delete_webhook_message(guild_channels[ch_id]["webhook_url"], msg_id, ch_id)
+        _delete_webhook_message(
+            guild_channels[ch_id]["webhook_url"], msg_id, ch_id, _thread_of(cluster, ch_id)
+        )
         for ch_id, msg_id in _cluster_messages(cluster)
         if msg_id != payload.message_id
         and ch_id in guild_channels
@@ -1024,7 +1073,9 @@ async def on_raw_bulk_message_delete(payload: discord.RawBulkMessageDeleteEvent)
             info = guild_channels.get(ch_id)
             if not info or not info.get("webhook_url"):
                 continue
-            tasks.append(_delete_webhook_message(info["webhook_url"], cluster_msg_id, ch_id))
+            tasks.append(_delete_webhook_message(
+                info["webhook_url"], cluster_msg_id, ch_id, _thread_of(cluster, ch_id)
+            ))
 
         for _, mid in _cluster_messages(cluster):
             _msg_clusters.pop(mid, None)
@@ -1670,6 +1721,7 @@ async def _edit_message_parts(
     messages when the new content needs more or fewer parts. Raises on failure;
     the cluster's extra_parts always reflects what actually exists."""
     chunks = _split_message(full_content)
+    thread_kwargs = _thread_kwargs(_thread_of(cluster, ch_id))
     extra_parts = cluster.setdefault("extra_parts", {})
     extras = extra_parts.setdefault(ch_id, [])
     ids = [msg_id, *extras]
@@ -1677,23 +1729,21 @@ async def _edit_message_parts(
         webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
         for index, chunk in enumerate(chunks):
             if index < len(ids):
-                await webhook.edit_message(ids[index], content=chunk)
+                await webhook.edit_message(ids[index], content=chunk, **thread_kwargs)
                 continue
             kwargs: dict = {
                 "content": chunk, "wait": True,
                 "username": cluster.get("author", ""),
                 "avatar_url": cluster.get("avatar_url", ""),
             }
-            thread_id = cluster.get("thread_channels", {}).get(ch_id)
-            if thread_id:
-                kwargs["thread"] = discord.Object(id=thread_id)
+            kwargs.update(thread_kwargs)
             part = await _webhook_send(webhook_url, kwargs, [])
             extras.append(part.id)
             _msg_clusters[part.id] = cluster
         for surplus in ids[len(chunks):]:
             extras.remove(surplus)
             _msg_clusters.pop(surplus, None)
-            await _delete_webhook_message(webhook_url, surplus, ch_id)
+            await _delete_webhook_message(webhook_url, surplus, ch_id, _thread_of(cluster, ch_id))
     finally:
         if not extras:
             extra_parts.pop(ch_id, None)
@@ -1701,10 +1751,12 @@ async def _edit_message_parts(
             cluster.pop("extra_parts", None)
 
 
-async def _delete_webhook_message(webhook_url: str, msg_id: int, ch_id: int) -> None:
+async def _delete_webhook_message(
+    webhook_url: str, msg_id: int, ch_id: int, thread_id: int | None = None
+) -> None:
     try:
         webhook = discord.Webhook.from_url(webhook_url, session=_get_http_session())
-        await webhook.delete_message(msg_id)
+        await webhook.delete_message(msg_id, **_thread_kwargs(thread_id))
     except Exception as e:
         log_event(f"Failed to delete webhook message {msg_id} in channel {ch_id}: {e}")
 

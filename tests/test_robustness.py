@@ -351,7 +351,7 @@ def delete_env(monkeypatch):
     monkeypatch.setattr(bot_module, "_guild_channels_for", lambda cid: guild_channels)
     deleted = []
 
-    async def fake_delete(url, msg_id, ch_id):
+    async def fake_delete(url, msg_id, ch_id, thread_id=None):
         deleted.append((url, msg_id))
         # The bot's own delete fires the same event for the mirror message.
         await bot_module.on_raw_message_delete(SimpleNamespace(message_id=msg_id, channel_id=ch_id))
