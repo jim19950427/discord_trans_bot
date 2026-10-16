@@ -1910,6 +1910,101 @@ async def _do_retranslate(parent_ch_id: int, msg_id: int, cluster: dict, guild_i
         return None
 
 
+def _untranslated_copies(cluster: dict) -> list[int]:
+    """Mirror channels whose delivered text is still the untranslated source
+    (what a provider outage leaves behind). Copies whose destination matches
+    the source language also look like this; re-translating those yields the
+    same text and is skipped."""
+    source_ch = cluster["source_ch"]
+    source_text = cluster["contents"].get(source_ch, "")
+    if cluster.get("raw_forward") or not source_text or not has_translatable_content(source_text):
+        return []
+    return [
+        ch_id for ch_id, text in cluster["contents"].items()
+        if ch_id != source_ch and ch_id in cluster["channels"] and text == source_text
+    ]
+
+
+async def _retranslate_untranslated(cluster: dict, guild_id: int) -> tuple[int, int]:
+    """Re-translate every untranslated copy of one cluster in a single batch
+    and edit them in place. Returns (updated, failed)."""
+    source_ch = cluster["source_ch"]
+    source_text = cluster["contents"].get(source_ch, "")
+    group = _guild_channels_for(source_ch)
+    targets = [ch for ch in _untranslated_copies(cluster) if group.get(ch, {}).get("webhook_url")]
+    if not targets:
+        return 0, 0
+    outcomes = await asyncio.to_thread(
+        translate_many_with_status,
+        source_text,
+        [normalize_lang(group[ch]["lang"]) for ch in targets],
+        get_guild_glossary(guild_id, _glossary_data),
+        get_guild_substitutions(guild_id, _substitutions_data),
+    )
+    updated = failed = 0
+    for ch_id in targets:
+        # The source may have been edited while translating; that edit
+        # already re-translated every copy, so don't overwrite it.
+        if cluster["contents"].get(source_ch) != source_text:
+            break
+        outcome = outcomes.get(normalize_lang(group[ch_id]["lang"]))
+        if (
+            outcome is None or not outcome.provider_succeeded or not outcome.text
+            or outcome.text.strip() == source_text.strip()
+        ):
+            if outcome is None or not outcome.provider_succeeded:
+                failed += 1
+            continue
+        prefix = cluster.get("prefixes", {}).get(ch_id, "")
+        full_content = f"{prefix}\n{outcome.text}" if prefix else outcome.text
+        try:
+            await _edit_message_parts(
+                group[ch_id]["webhook_url"], cluster["channels"][ch_id], ch_id, cluster, full_content
+            )
+            cluster["contents"][ch_id] = outcome.text
+            updated += 1
+        except Exception as e:
+            failed += 1
+            log_event(f"[bulk-retranslate] edit failed ch={ch_id}: {type(e).__name__}")
+    return updated, failed
+
+
+_bulk_retranslate_running: set[int] = set()
+
+
+async def _bulk_retranslate(guild_id: int, since: float) -> dict:
+    """Re-translate every tracked message of a guild sent at or after `since`
+    (unix seconds) whose copies were delivered untranslated."""
+    guild_channels = channel_configs.get(guild_id, {})
+    clusters = {id(c): c for c in _msg_clusters.values()}.values()
+    todo = []
+    for cluster in clusters:
+        source_ch = cluster["source_ch"]
+        source_id = cluster["channels"].get(source_ch)
+        if source_ch not in guild_channels or not source_id:
+            continue
+        sent_at = discord.utils.snowflake_time(source_id).timestamp()
+        if sent_at >= since and _untranslated_copies(cluster):
+            todo.append((sent_at, cluster))
+    todo.sort(key=lambda pair: pair[0])
+
+    stats = {"messages": len(todo), "updated": 0, "failed": 0}
+    for _, cluster in todo:
+        try:
+            updated, failed = await _retranslate_untranslated(cluster, guild_id)
+        except Exception as e:
+            updated, failed = 0, 1
+            log_event(f"[bulk-retranslate] cluster failed: {type(e).__name__}")
+        stats["updated"] += updated
+        stats["failed"] += failed
+        await asyncio.sleep(0.5)  # stay well under webhook edit rate limits
+    log_event(
+        f"[bulk-retranslate] guild={guild_id} messages={stats['messages']} "
+        f"updated={stats['updated']} failed={stats['failed']}"
+    )
+    return stats
+
+
 async def _handle_feedback(payload: discord.RawReactionActionEvent, cluster: dict) -> None:
     """Re-translate the message for the channel where 🔄 was reacted."""
     react_ch_id = payload.channel_id
@@ -2125,6 +2220,36 @@ async def slash_translation_status(interaction: discord.Interaction):
             color=discord.Color.orange(),
         )
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="retranslate-recent", description="補翻最近幾小時內未翻譯（原文轉發）的訊息")
+@app_commands.describe(hours="往回追溯的小時數（1–72）")
+@app_commands.checks.has_permissions(manage_channels=True)
+async def slash_retranslate_recent(
+    interaction: discord.Interaction, hours: app_commands.Range[int, 1, 72]
+):
+    guild_id = interaction.guild_id
+    if guild_id is None:
+        await interaction.response.send_message("請在伺服器內使用此指令。", ephemeral=True)
+        return
+    if guild_id in _bulk_retranslate_running:
+        await interaction.response.send_message("補翻已在進行中，請稍候。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    _bulk_retranslate_running.add(guild_id)
+    try:
+        stats = await _bulk_retranslate(guild_id, time.time() - hours * 3600)
+    finally:
+        _bulk_retranslate_running.discard(guild_id)
+    text = (
+        f"補翻完成：檢查 {stats['messages']} 則未翻譯訊息，"
+        f"更新 {stats['updated']} 個副本，失敗 {stats['failed']} 個。"
+    )
+    try:
+        await interaction.followup.send(text, ephemeral=True)
+    except discord.HTTPException:
+        pass  # the interaction token expires after 15 minutes; the log has the totals
+
 
 @bot.tree.command(name="addlang", description="設定語言頻道")
 @app_commands.describe(

@@ -63,6 +63,7 @@ Azure 的安全提供者事件包含 `target_count`（該批去重後的目標�
 | `/removelang [channel:#頻道]` | `!removelang [#頻道]` | 管理頻道 | 取消語言頻道設定並刪除對應 Webhook |
 | `/listlang` | `!listlang` | 所有人 | 列出目前所有語言頻道（依群組分組顯示） |
 | `/translation-status` | — | 管理頻道 | 僅呼叫者可見的 Azure／LibreTranslate 健康狀態 |
+| `/retranslate-recent` | `hours`（1–72） | 管理頻道 | 補翻這段時間內被原文轉發（翻譯服務故障時）的訊息，逐則批次翻譯後就地編輯 |
 
 `/translation-status` 會顯示 Azure 設定、斷路器與最近批次結果，LibreTranslate 的受限 `/languages` 探測，以及最近備援時間與原因。輸出固定只含這些健康欄位，不會顯示金鑰、Webhook URL、訊息原文或翻譯內容。
 
